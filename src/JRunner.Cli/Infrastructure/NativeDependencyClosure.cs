@@ -248,10 +248,12 @@ internal sealed class NativeDependencyClosure
         private string? _canonicalPath;
         private string? _root;
         private string? _sourceDetails;
+        private readonly string _outputDirectory;
         private readonly Action<Exception> _originObserver;
 
-        private PreparationDiagnostic()
+        private PreparationDiagnostic(string outputDirectory)
         {
+            _outputDirectory = outputDirectory;
             _originObserver = CaptureOrigin;
         }
 
@@ -261,8 +263,17 @@ internal sealed class NativeDependencyClosure
         {
             try
             {
-                return production && string.Equals(Environment.GetEnvironmentVariable("JRUNNER_NATIVE_CLOSURE_DIAGNOSTIC"),
-                    "1", StringComparison.Ordinal) ? new PreparationDiagnostic() : null;
+                if (!production || !string.Equals(Environment.GetEnvironmentVariable("JRUNNER_NATIVE_CLOSURE_DIAGNOSTIC"),
+                    "1", StringComparison.Ordinal))
+                {
+                    return null;
+                }
+                string? directory = Environment.GetEnvironmentVariable("JRUNNER_NATIVE_CLOSURE_DIAGNOSTIC_DIRECTORY");
+                if (string.IsNullOrEmpty(directory) || !Path.IsPathFullyQualified(directory) || !Directory.Exists(directory))
+                {
+                    return null;
+                }
+                return new PreparationDiagnostic(directory);
             }
             catch
             {
@@ -357,11 +368,80 @@ internal sealed class NativeDependencyClosure
                 text.Append(_sourceDetails);
                 text.Append(DescribeException(exception, "caught",
                     Math.Min(MaximumCaughtCharacters, MaximumLineCharacters - text.Length)));
-                Console.Error.Write(text.Append('\n').ToString());
+                DiagnosticFileSink.WriteLine(_outputDirectory, text.Append('\n').ToString());
             }
             catch
             {
                 // Diagnostics must never change the existing public redacted failure.
+            }
+        }
+
+        private static class DiagnosticFileSink
+        {
+            private const int MaximumFileBytes = 256 * 1024;
+            private static readonly object Sync = new();
+            private static FileStream? _stream;
+            private static string? _directory;
+            private static int _writtenBytes;
+            private static bool _disabled;
+
+            static DiagnosticFileSink()
+            {
+                // Initialize the process-wide lock only when a gated production failure reports.
+            }
+
+            internal static void WriteLine(string directory, string line)
+            {
+                if (!OperatingSystem.IsLinux())
+                {
+                    return;
+                }
+                lock (Sync)
+                {
+                    if (_disabled || line.Length > MaximumLineCharacters + 1 ||
+                        line.Length > MaximumFileBytes - _writtenBytes ||
+                        (_directory is not null && !string.Equals(_directory, directory, StringComparison.Ordinal)))
+                    {
+                        return;
+                    }
+                    try
+                    {
+                        if (_stream is null)
+                        {
+                            Span<byte> suffix = stackalloc byte[16];
+                            RandomNumberGenerator.Fill(suffix);
+                            string fileName = string.Concat("jrunner-native-closure-diagnostic-",
+                                Environment.ProcessId.ToString(CultureInfo.InvariantCulture), "-",
+                                Convert.ToHexString(suffix), ".log");
+                            _stream = new FileStream(Path.Combine(directory, fileName), new FileStreamOptions
+                            {
+                                Mode = FileMode.CreateNew,
+                                Access = FileAccess.Write,
+                                Share = FileShare.None,
+                                BufferSize = 1,
+                                UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite,
+                            });
+                            _directory = directory;
+                        }
+                        Span<byte> bytes = stackalloc byte[line.Length];
+                        int length = Encoding.ASCII.GetBytes(line.AsSpan(), bytes);
+                        _stream.Write(bytes[..length]);
+                        _stream.Flush();
+                        _writtenBytes += length;
+                    }
+                    catch
+                    {
+                        _disabled = true;
+                        try
+                        {
+                            _stream?.Dispose();
+                        }
+                        catch
+                        {
+                        }
+                        _stream = null;
+                    }
+                }
             }
         }
 

@@ -34,7 +34,29 @@ jobs:
       - name: Test native solution
         env:
           JRUNNER_NATIVE_CLOSURE_DIAGNOSTIC: '1'
+          JRUNNER_NATIVE_CLOSURE_DIAGNOSTIC_DIRECTORY: ${{ runner.temp }}
         run: dotnet test JRunner.Native.sln -c Release --no-build
+
+      - name: Print native closure diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          token="$(cat /proc/sys/kernel/random/uuid)"
+          printf '::stop-commands::%s\n' "$token"
+          trap 'printf "::%s::\n" "$token"' EXIT
+          count=0
+          for diagnostic in "$RUNNER_TEMP"/jrunner-native-closure-diagnostic-*.log; do
+            if [[ ! -f "$diagnostic" || -L "$diagnostic" ]]; then
+              continue
+            fi
+            printf '%s\n' '--- native closure diagnostic ---'
+            head -c 262144 -- "$diagnostic"
+            printf '\n'
+            count=$((count + 1))
+            if (( count >= 8 )); then
+              break
+            fi
+          done
 
       - name: Publish Linux CLI
         run: >-
