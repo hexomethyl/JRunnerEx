@@ -535,9 +535,12 @@ public sealed class PtyPicoFlasherIntegrationTests
         string output = Path.Combine(directory.Root, "dump.bin");
         int payloadSize = emmc ? 512 : 528;
         PicoFlasherCommand streamOpcode = emmc ? PicoFlasherCommand.EmmcReadStream : PicoFlasherCommand.ReadFlashStream;
-        var partialRecordSent = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        byte[] queuedTail = Payload(payloadSize + 4 + 29, 0x55);
+        using var commandCancellation = new CancellationTokenSource();
         await using var firmware = PtyPicoFirmware.Create();
-        PicoFlasherConnectionFactory connectionFactory = CreateConnectionFactory(firmware);
+        var transportFactory = new StreamFailureTransportFactory(
+            streamOpcode, payloadSize, cancel, commandCancellation, firmware.LifetimeToken);
+        PicoFlasherConnectionFactory connectionFactory = CreateConnectionFactory(firmware, transportFactory);
         firmware.Start(async (terminal, token) =>
         {
             await ServePreflightAsync(terminal, emmc ? EmmcConfiguration : NandConfiguration, token);
@@ -550,47 +553,32 @@ public sealed class PtyPicoFlasherIntegrationTests
             await terminal.WriteFragmentedAsync(RecordResponse(0, Payload(payloadSize, 0x15)), token);
             if (cancel)
             {
-                // Leave the client waiting inside the second payload, not between commands.
-                await terminal.WriteFragmentedAsync(RecordResponse(0, Payload(37, 0x33)), token);
-                partialRecordSent.SetResult();
+                await terminal.WriteFragmentedAsync(
+                    RecordResponse(0, Payload(StreamFailureTransportFactory.PartialPayloadByteCount, 0x33)),
+                    token);
             }
             else
             {
                 await terminal.WriteUInt32Async(0xBAD, token);
             }
 
+            // Do not let fragment scheduling race the client's 100 ms quiescence
+            // interval. The transport exposes the failure only after this entire
+            // already-queued tail is available to the real serial bytewise drain.
+            await transportFactory.FailureObserved.Task.WaitAsync(token);
+            await terminal.WriteFragmentedAsync(queuedTail, token);
+            transportFactory.TailQueued.SetResult();
             terminal.ReceiveCommand(streamOpcode, 0, token);
-            // Firmware may already have queued a partial record when the reset arrives.
-            // These bytes must be drained, not mistaken for the next session's version.
-            await terminal.WriteFragmentedAsync(Payload(payloadSize + 4 + 29, 0x55), token);
             terminal.ReceiveCommand(PicoFlasherCommand.StartSmc, 0, token);
             await ServeProbeAsync(terminal, token);
         });
 
-        using var commandCancellation = new CancellationTokenSource();
         Task<CliResult> read = RunPicoAsync(
             firmware,
             connectionFactory,
             emmc ? "emmc-read" : "nand-read",
             ["--start-block", "0", "--blocks", "3", "--output", output],
             commandCancellation.Token);
-        if (cancel)
-        {
-            Task completed = await Task.WhenAny(read, partialRecordSent.Task).WaitAsync(firmware.LifetimeToken);
-            if (read.IsCompleted)
-            {
-                CliResult earlyRun = await read;
-                Assert.Fail(
-                    $"The read completed before caller cancellation was requested (exit {earlyRun.ExitCode}). "
-                        + $"stdout: {earlyRun.StandardOutput} stderr: {earlyRun.StandardError}");
-            }
-
-            if (completed == partialRecordSent.Task)
-            {
-                await partialRecordSent.Task;
-                commandCancellation.Cancel();
-            }
-        }
 
         CliResult failedRun = await read;
         JsonElement error = AssertError(
@@ -604,6 +592,10 @@ public sealed class PtyPicoFlasherIntegrationTests
         }
 
         Assert.Empty(Directory.GetFiles(directory.Root));
+        Assert.Equal(queuedTail.Length, transportFactory.DrainedByteCount);
+        Assert.Equal(
+            cancel ? StreamFailureTransportFactory.PartialPayloadByteCount : 0,
+            transportFactory.PartialPayloadBytesReceived);
         CliResult reopenedRun = await RunPicoAsync(firmware, connectionFactory, "probe");
 
         AssertProbeResult(reopenedRun, firmware.SlavePath);
@@ -772,9 +764,11 @@ public sealed class PtyPicoFlasherIntegrationTests
         await firmware.WriteFragmentedAsync(ExtendedCsd(capacity), token);
     }
 
-    private static PicoFlasherConnectionFactory CreateConnectionFactory(PtyPicoFirmware firmware) => new(
+    private static PicoFlasherConnectionFactory CreateConnectionFactory(
+        PtyPicoFirmware firmware,
+        IPicoFlasherTransportFactory? transportFactory = null) => new(
         new FixedEndpointEnumerator(new PicoFlasherDeviceEndpoint(firmware.SlavePath, SerialNumber, interfaceNumber: 0)),
-        new SerialPicoFlasherTransportFactory());
+        transportFactory ?? new SerialPicoFlasherTransportFactory());
 
     private static Task<CliResult> RunPicoAsync(
         PtyPicoFirmware firmware,
@@ -961,6 +955,128 @@ public sealed class PtyPicoFlasherIntegrationTests
         {
             cancellationToken.ThrowIfCancellationRequested();
             return new ValueTask<IReadOnlyList<PicoFlasherDeviceEndpoint>>([endpoint]);
+        }
+    }
+
+    private sealed class StreamFailureTransportFactory : IPicoFlasherTransportFactory
+    {
+        internal const int PartialPayloadByteCount = 37;
+        private readonly SerialPicoFlasherTransportFactory _serialFactory = new();
+        private readonly PicoFlasherCommand _streamOpcode;
+        private readonly int _payloadSize;
+        private readonly bool _cancel;
+        private readonly CancellationTokenSource _commandCancellation;
+        private readonly CancellationToken _lifetimeToken;
+
+        internal StreamFailureTransportFactory(
+            PicoFlasherCommand streamOpcode,
+            int payloadSize,
+            bool cancel,
+            CancellationTokenSource commandCancellation,
+            CancellationToken lifetimeToken)
+        {
+            _streamOpcode = streamOpcode;
+            _payloadSize = payloadSize;
+            _cancel = cancel;
+            _commandCancellation = commandCancellation;
+            _lifetimeToken = lifetimeToken;
+        }
+
+        internal TaskCompletionSource FailureObserved { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal TaskCompletionSource TailQueued { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal int DrainedByteCount { get; private set; }
+
+        internal int PartialPayloadBytesReceived { get; private set; }
+
+        public async ValueTask<IPicoFlasherTransport> OpenAsync(
+            PicoFlasherDeviceEndpoint endpoint,
+            TimeSpan noProgressTimeout,
+            CancellationToken cancellationToken = default)
+        {
+            IPicoFlasherTransport transport = await _serialFactory.OpenAsync(
+                endpoint, noProgressTimeout, cancellationToken);
+            return new StreamFailureTransport(transport, this);
+        }
+
+        private async Task AwaitQueuedTailAsync()
+        {
+            FailureObserved.TrySetResult();
+            await TailQueued.Task.WaitAsync(_lifetimeToken);
+        }
+
+        private sealed class StreamFailureTransport(
+            IPicoFlasherTransport transport,
+            StreamFailureTransportFactory owner) : IPicoFlasherTransport
+        {
+            private bool _streaming;
+            private bool _draining;
+            private int _responseReadCount;
+
+            public async ValueTask WriteAsync(
+                ReadOnlyMemory<byte> source,
+                CancellationToken cancellationToken = default)
+            {
+                byte opcode = source.Span[0];
+                uint lba = BinaryPrimitives.ReadUInt32LittleEndian(source.Span[1..]);
+                await transport.WriteAsync(source, cancellationToken);
+                _streaming = opcode == (byte)owner._streamOpcode && lba != 0;
+                _draining = opcode == (byte)owner._streamOpcode && lba == 0;
+                _responseReadCount = 0;
+            }
+
+            public async ValueTask ReadExactlyAsync(
+                Memory<byte> destination,
+                CancellationToken cancellationToken = default)
+            {
+                if (_draining)
+                {
+                    Assert.Equal(1, destination.Length);
+                    await transport.ReadExactlyAsync(destination, cancellationToken);
+                    owner.DrainedByteCount++;
+                    return;
+                }
+
+                int responseRead = _streaming ? ++_responseReadCount : 0;
+                if (owner._cancel && responseRead == 4)
+                {
+                    Assert.Equal(owner._payloadSize, destination.Length);
+                    await transport.ReadExactlyAsync(
+                        destination[..PartialPayloadByteCount], cancellationToken);
+                    owner.PartialPayloadBytesReceived = PartialPayloadByteCount;
+
+                    // Request cancellation only once the first record and the
+                    // second status plus partial payload have really been read.
+                    // Start the remaining real serial read before cancelling it.
+                    Task remainingPayload = transport.ReadExactlyAsync(
+                        destination[PartialPayloadByteCount..], cancellationToken).AsTask();
+                    owner._commandCancellation.Cancel();
+                    try
+                    {
+                        await remainingPayload;
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        await owner.AwaitQueuedTailAsync();
+                        throw;
+                    }
+
+                    Assert.Fail("The partial payload read completed without observing caller cancellation.");
+                }
+
+                await transport.ReadExactlyAsync(destination, cancellationToken);
+                if (!owner._cancel && responseRead == 3)
+                {
+                    Assert.Equal(PicoFlasherProtocol.StatusSize, destination.Length);
+                    Assert.Equal(0xBADU, PicoFlasherProtocol.ReadStatus(destination.Span));
+                    await owner.AwaitQueuedTailAsync();
+                }
+            }
+
+            public ValueTask DisposeAsync() => transport.DisposeAsync();
         }
     }
 

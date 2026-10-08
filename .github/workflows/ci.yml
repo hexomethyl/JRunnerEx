@@ -13,74 +13,94 @@ jobs:
   native:
     name: Native Ubuntu
     runs-on: ubuntu-24.04
+    # .NET SDK 10.0.401 on Ubuntu 24.04.5, linux/amd64. This digest avoids
+    # unsafe optional loader-cache entries in the mutable hosted runner image.
+    container:
+      image: mcr.microsoft.com/dotnet/sdk@sha256:e70cdb7f80b0348f5cb85f19a8f670fca061f033d57eed12fa003d58b0e06317
     timeout-minutes: 20
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Set up .NET
-        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
-        with:
-          dotnet-version: 10.0.401
-          cache: true
-          cache-dependency-path: "**/packages.lock.json"
-
-      # Temporary: establish whether the hosted image's loader-cache entry is
-      # outside the protected-native threat model. Remove after diagnosis.
-      - name: Inspect hosted loader-cache roots
+      - name: Verify native CI image and prepare unprivileged workspace
         shell: bash
         run: |
-          id
-          for path in /usr/local/lib/libsourcekitdInProc.so /usr/local/lib/xeon_phi; do
-            printf '%s\n' "--- $path ---"
-            namei -l -- "$path" || true
-            stat -c '%n type=%F uid=%u gid=%g mode=%a' -- "$path" || true
-            stat -Lc '%n resolved-type=%F uid=%u gid=%g mode=%a' -- "$path" || true
-          done
+          set -euo pipefail
+          . /etc/os-release
+          test "$ID" = ubuntu
+          test "$VERSION_ID" = 24.04
+          test "$(uname -m)" = x86_64
+          test "$(id -u)" = 0
+          test "$(dotnet --version)" = 10.0.401
+          ! getent passwd 1001
+          ! getent group 1001
+          ! getent passwd jrunner
+          ! getent group jrunner
+          groupadd --gid 1001 jrunner
+          useradd --uid 1001 --gid 1001 --create-home --home-dir /home/jrunner --shell /usr/sbin/nologin jrunner
+          chown -R 1001:1001 "$GITHUB_WORKSPACE" "$RUNNER_TEMP" /home/jrunner
+          chmod go-w "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+          chmod 700 /home/jrunner
+          assert_protected_ancestry() {
+            local path="$1"
+            while :; do
+              namei -l -- "$path"
+              case "$(stat -c '%u' -- "$path")" in
+                0|1001) ;;
+                *) printf 'unexpected ancestry owner: %s\n' "$path" >&2; return 1 ;;
+              esac
+              chmod go-w -- "$path"
+              local mode
+              mode="$(stat -c '%a' -- "$path")"
+              if (( (8#$mode & 0022) != 0 )); then
+                printf 'group/other-writable ancestry: %s\n' "$path" >&2
+                return 1
+              fi
+              [[ "$path" = / ]] && return
+              path="$(dirname -- "$path")"
+            done
+          }
+          assert_protected_ancestry "$GITHUB_WORKSPACE"
+          assert_protected_ancestry "$RUNNER_TEMP"
+          assert_protected_ancestry /home/jrunner
+          setpriv --reuid=1001 --regid=1001 --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- test -w "$GITHUB_WORKSPACE"
 
       - name: Restore locked dependencies
-        run: dotnet restore JRunner.Native.sln --locked-mode
+        run: >-
+          setpriv --reuid=1001 --regid=1001 --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all --
+          env HOME=/home/jrunner DOTNET_CLI_HOME=/home/jrunner
+          dotnet restore JRunner.Native.sln --locked-mode
 
       - name: Build native solution
-        run: dotnet build JRunner.Native.sln -c Release --no-restore
+        run: >-
+          setpriv --reuid=1001 --regid=1001 --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all --
+          env HOME=/home/jrunner DOTNET_CLI_HOME=/home/jrunner
+          dotnet build JRunner.Native.sln -c Release --no-restore
 
       - name: Test native solution
-        env:
-          JRUNNER_NATIVE_CLOSURE_DIAGNOSTIC: '1'
-          JRUNNER_NATIVE_CLOSURE_DIAGNOSTIC_DIRECTORY: ${{ runner.temp }}
-        run: dotnet test JRunner.Native.sln -c Release --no-build
-
-      - name: Print native closure diagnostics
-        if: failure()
-        shell: bash
-        run: |
-          token="$(cat /proc/sys/kernel/random/uuid)"
-          printf '::stop-commands::%s\n' "$token"
-          trap 'printf "::%s::\n" "$token"' EXIT
-          count=0
-          for diagnostic in "$RUNNER_TEMP"/jrunner-native-closure-diagnostic-*.log; do
-            if [[ ! -f "$diagnostic" || -L "$diagnostic" ]]; then
-              continue
-            fi
-            printf '%s\n' '--- native closure diagnostic ---'
-            head -c 262144 -- "$diagnostic"
-            printf '\n'
-            count=$((count + 1))
-            if (( count >= 8 )); then
-              break
-            fi
-          done
+        run: >-
+          setpriv --reuid=1001 --regid=1001 --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all --
+          env HOME=/home/jrunner DOTNET_CLI_HOME=/home/jrunner
+          dotnet test JRunner.Native.sln -c Release --no-build
 
       - name: Publish Linux CLI
         run: >-
+          setpriv --reuid=1001 --regid=1001 --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all --
+          env HOME=/home/jrunner DOTNET_CLI_HOME=/home/jrunner
           dotnet publish src/JRunner.Cli/JRunner.Cli.csproj -c Release --no-restore
           -r linux-x64 --self-contained false -o artifacts/linux-x64
 
       - name: Smoke published apphost
-        run: ./artifacts/linux-x64/jrunner --help
+        run: >-
+          setpriv --reuid=1001 --regid=1001 --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all --
+          env HOME=/home/jrunner DOTNET_CLI_HOME=/home/jrunner
+          ./artifacts/linux-x64/jrunner --help
 
       - name: Archive Linux CLI with executable mode
-        run: tar -C artifacts -czf artifacts/jrunner-linux-x64.tar.gz linux-x64
+        run: >-
+          setpriv --reuid=1001 --regid=1001 --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all --
+          env HOME=/home/jrunner DOTNET_CLI_HOME=/home/jrunner
+          tar -C artifacts -czf artifacts/jrunner-linux-x64.tar.gz linux-x64
 
       - name: Upload Linux CLI archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

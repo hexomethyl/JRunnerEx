@@ -149,13 +149,14 @@ public sealed class CliSupportCommandTests
         string xdgDataHome = Path.Combine(homeDirectory.Path, "xdg");
         string xdgSupportRoot = Path.Combine(xdgDataHome, "jrunner", "support");
         string defaultRoot = Path.Combine(homeDirectory.Path, ".local", "share", "jrunner", "support");
-        await PrepareStatusRootAsync(xdgSupportRoot, "support-corrupt");
-        await PrepareStatusRootAsync(defaultRoot, "support-incomplete");
+        await PrepareStatusRootAsync(xdgSupportRoot, "support-incomplete");
+        await PrepareStatusRootAsync(defaultRoot, "support-corrupt");
 
         ProcessResult result = await RunInIsolatedProcessAsync(
             CreateStartInfo(
                 ["support", "status", "--json"],
                 homeDirectory.Path,
+                environmentSupportRoot: null,
                 xdgDataHome: xdgDataHome));
 
         AssertFailureEnvelope(
@@ -164,7 +165,8 @@ public sealed class CliSupportCommandTests
             result.StandardError,
             ExitCode.MissingPrerequisite,
             "support-incomplete");
-        Assert.False(File.Exists(Path.Combine(defaultRoot, "active.json")));
+        Assert.False(File.Exists(Path.Combine(xdgSupportRoot, "active.json")));
+        Assert.True(File.Exists(Path.Combine(defaultRoot, "active.json")));
     }
 
     [Theory]
@@ -338,6 +340,8 @@ public sealed class CliSupportCommandTests
             startInfo.ArgumentList.Add(argument);
         }
 
+        // Override every support-root environment input in the child process only.
+        // Never mutate the environment shared with parallel tests.
         startInfo.Environment.Remove("JRUNNER_SUPPORT_ROOT");
         startInfo.Environment.Remove("XDG_DATA_HOME");
         startInfo.Environment["HOME"] = homeDirectory;

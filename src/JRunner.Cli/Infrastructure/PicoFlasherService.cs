@@ -24,6 +24,7 @@ internal sealed class PicoFlasherService
     private static readonly TimeSpan StreamQuiescenceTimeout = TimeSpan.FromMilliseconds(100);
     private readonly PicoFlasherConnection _connection;
     private readonly TimeSpan _smcStopWait;
+    private readonly TimeProvider _cleanupTimeProvider;
 
     /// <summary>
     /// Creates a service that uses the firmware-defined SMC stop delay.
@@ -34,9 +35,12 @@ internal sealed class PicoFlasherService
     }
 
     /// <summary>
-    /// Creates a service with an explicit SMC stop delay for deterministic transport tests.
+    /// Creates a service with explicit SMC timing and a cleanup clock for deterministic transport tests.
     /// </summary>
-    internal PicoFlasherService(PicoFlasherConnection connection, TimeSpan smcStopWait)
+    internal PicoFlasherService(
+        PicoFlasherConnection connection,
+        TimeSpan smcStopWait,
+        TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(connection);
         if (smcStopWait < TimeSpan.Zero)
@@ -51,6 +55,7 @@ internal sealed class PicoFlasherService
 
         _connection = connection;
         _smcStopWait = smcStopWait;
+        _cleanupTimeProvider = timeProvider ?? TimeProvider.System;
     }
 
     /// <summary>
@@ -879,7 +884,7 @@ internal sealed class PicoFlasherService
         }
     }
 
-    private static async Task ReadEmmcStreamAsync(
+    private async Task ReadEmmcStreamAsync(
         IPicoFlasherTransport transport,
         byte[] buffer,
         Stream output,
@@ -1302,7 +1307,7 @@ internal sealed class PicoFlasherService
         }
     }
 
-    private static async ValueTask<StreamCleanupOutcome> StopAndQuiesceStreamAfterFailureAsync(
+    private async ValueTask<StreamCleanupOutcome> StopAndQuiesceStreamAfterFailureAsync(
         IPicoFlasherTransport transport,
         byte[] buffer,
         PicoFlasherCommand streamCommand,
@@ -1326,7 +1331,7 @@ internal sealed class PicoFlasherService
             return StreamCleanupOutcome.ResetWriteIndeterminate;
         }
 
-        using var quiescenceTimeout = new CancellationTokenSource();
+        var quiescenceTimeout = new CancellationTokenSource(Timeout.InfiniteTimeSpan, _cleanupTimeProvider);
         try
         {
             int drainedByteCount = 0;
@@ -1342,7 +1347,11 @@ internal sealed class PicoFlasherService
                         .ConfigureAwait(false);
                     if (!quiescenceTimeout.TryReset())
                     {
-                        return StreamCleanupOutcome.DrainFailed;
+                        // Successful progress may be consumed after the old timer
+                        // fires. Start a fresh no-progress interval rather than
+                        // treating scheduler delay as an indeterminate drain.
+                        quiescenceTimeout.Dispose();
+                        quiescenceTimeout = new CancellationTokenSource(Timeout.InfiniteTimeSpan, _cleanupTimeProvider);
                     }
 
                     if (drainedByteCount == maximumQueuedByteCount)
@@ -1368,6 +1377,10 @@ internal sealed class PicoFlasherService
         catch (Exception)
         {
             return StreamCleanupOutcome.DrainFailed;
+        }
+        finally
+        {
+            quiescenceTimeout.Dispose();
         }
     }
 

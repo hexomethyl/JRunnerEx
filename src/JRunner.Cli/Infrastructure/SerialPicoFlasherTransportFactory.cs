@@ -107,6 +107,7 @@ internal sealed class SerialPicoFlasherTransport : IPicoFlasherTransport
 {
     private SerialPort? _port;
     private Stream? _stream;
+    private readonly TimeProvider _timeProvider;
     private int _disposed;
 
     internal TimeSpan NoProgressTimeout { get; }
@@ -117,16 +118,21 @@ internal sealed class SerialPicoFlasherTransport : IPicoFlasherTransport
         NoProgressTimeout = NormalizeNoProgressTimeout(noProgressTimeout);
         _port = port;
         _stream = port.BaseStream;
+        _timeProvider = TimeProvider.System;
     }
 
     /// <summary>
     /// Creates a transport over a caller-owned stream for infrastructure tests.
     /// </summary>
-    internal SerialPicoFlasherTransport(Stream stream, TimeSpan noProgressTimeout)
+    internal SerialPicoFlasherTransport(
+        Stream stream,
+        TimeSpan noProgressTimeout,
+        TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(stream);
         NoProgressTimeout = NormalizeNoProgressTimeout(noProgressTimeout);
         _stream = stream;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     /// <inheritdoc />
@@ -137,9 +143,18 @@ internal sealed class SerialPicoFlasherTransport : IPicoFlasherTransport
         cancellationToken.ThrowIfCancellationRequested();
         Stream stream = GetStream();
 
-        using CancellationTokenSource timeoutSource = CreateTimeoutSource(cancellationToken);
-        await WriteWithTimeoutAsync(stream, source, cancellationToken, timeoutSource).ConfigureAwait(false);
-        await FlushWithTimeoutAsync(stream, cancellationToken, timeoutSource).ConfigureAwait(false);
+        var deadline = new NoProgressDeadline(_timeProvider, cancellationToken);
+        try
+        {
+            await WriteWithTimeoutAsync(stream, source, cancellationToken, deadline.Reset(NoProgressTimeout))
+                .ConfigureAwait(false);
+            await FlushWithTimeoutAsync(stream, cancellationToken, deadline.Reset(NoProgressTimeout))
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            deadline.Dispose();
+        }
     }
 
     /// <inheritdoc />
@@ -150,27 +165,34 @@ internal sealed class SerialPicoFlasherTransport : IPicoFlasherTransport
         cancellationToken.ThrowIfCancellationRequested();
         Stream stream = GetStream();
 
-        using CancellationTokenSource timeoutSource = CreateTimeoutSource(cancellationToken);
-        while (!destination.IsEmpty)
+        var deadline = new NoProgressDeadline(_timeProvider, cancellationToken);
+        try
         {
-            int bytesRead = await ReadWithTimeoutAsync(
-                    stream,
-                    destination,
-                    cancellationToken,
-                    timeoutSource)
-                .ConfigureAwait(false);
-            if (bytesRead == 0)
+            while (!destination.IsEmpty)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                throw TransportClosed();
-            }
+                int bytesRead = await ReadWithTimeoutAsync(
+                        stream,
+                        destination,
+                        cancellationToken,
+                        deadline.Reset(NoProgressTimeout))
+                    .ConfigureAwait(false);
+                if (bytesRead == 0)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    throw TransportClosed();
+                }
 
-            if ((uint)bytesRead > (uint)destination.Length)
-            {
-                throw TransportIoFailed();
-            }
+                if ((uint)bytesRead > (uint)destination.Length)
+                {
+                    throw TransportIoFailed();
+                }
 
-            destination = destination[bytesRead..];
+                destination = destination[bytesRead..];
+            }
+        }
+        finally
+        {
+            deadline.Dispose();
         }
     }
 
@@ -212,7 +234,6 @@ internal sealed class SerialPicoFlasherTransport : IPicoFlasherTransport
         CancellationToken cancellationToken,
         CancellationTokenSource timeoutSource)
     {
-        ResetTimeout(timeoutSource);
         try
         {
             return await stream.ReadAsync(destination, timeoutSource.Token).ConfigureAwait(false);
@@ -220,6 +241,10 @@ internal sealed class SerialPicoFlasherTransport : IPicoFlasherTransport
         catch (Exception exception)
         {
             throw MapTransportException(exception, cancellationToken, timeoutSource.Token);
+        }
+        finally
+        {
+            timeoutSource.CancelAfter(Timeout.InfiniteTimeSpan);
         }
     }
 
@@ -229,7 +254,6 @@ internal sealed class SerialPicoFlasherTransport : IPicoFlasherTransport
         CancellationToken cancellationToken,
         CancellationTokenSource timeoutSource)
     {
-        ResetTimeout(timeoutSource);
         try
         {
             await stream.WriteAsync(source, timeoutSource.Token).ConfigureAwait(false);
@@ -238,6 +262,10 @@ internal sealed class SerialPicoFlasherTransport : IPicoFlasherTransport
         {
             throw MapTransportException(exception, cancellationToken, timeoutSource.Token);
         }
+        finally
+        {
+            timeoutSource.CancelAfter(Timeout.InfiniteTimeSpan);
+        }
     }
 
     private async ValueTask FlushWithTimeoutAsync(
@@ -245,7 +273,6 @@ internal sealed class SerialPicoFlasherTransport : IPicoFlasherTransport
         CancellationToken cancellationToken,
         CancellationTokenSource timeoutSource)
     {
-        ResetTimeout(timeoutSource);
         try
         {
             await stream.FlushAsync(timeoutSource.Token).ConfigureAwait(false);
@@ -254,16 +281,58 @@ internal sealed class SerialPicoFlasherTransport : IPicoFlasherTransport
         {
             throw MapTransportException(exception, cancellationToken, timeoutSource.Token);
         }
+        finally
+        {
+            timeoutSource.CancelAfter(Timeout.InfiniteTimeSpan);
+        }
     }
 
-    private static CancellationTokenSource CreateTimeoutSource(CancellationToken cancellationToken)
+    // Reuse one timer for ordinary progress. Before rearming, reject an expired
+    // source or an already-queued callback from the previous completed I/O.
+    private struct NoProgressDeadline : IDisposable
     {
-        return CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-    }
+        private readonly TimeProvider _timeProvider;
+        private readonly CancellationToken _callerCancellationToken;
+        private CancellationTokenSource _source;
+        private CancellationTokenRegistration _callerCancellation;
 
-    private void ResetTimeout(CancellationTokenSource timeoutSource)
-    {
-        timeoutSource.CancelAfter(NoProgressTimeout);
+        internal NoProgressDeadline(TimeProvider timeProvider, CancellationToken cancellationToken)
+        {
+            _timeProvider = timeProvider;
+            _callerCancellationToken = cancellationToken;
+            _source = CreateSource(timeProvider, cancellationToken, out _callerCancellation);
+        }
+
+        internal CancellationTokenSource Reset(TimeSpan timeout)
+        {
+            _callerCancellationToken.ThrowIfCancellationRequested();
+            if (!_source.TryReset())
+            {
+                Dispose();
+                _source = CreateSource(_timeProvider, _callerCancellationToken, out _callerCancellation);
+            }
+
+            _source.CancelAfter(timeout);
+            return _source;
+        }
+
+        private static CancellationTokenSource CreateSource(
+            TimeProvider timeProvider,
+            CancellationToken cancellationToken,
+            out CancellationTokenRegistration callerCancellation)
+        {
+            var source = new CancellationTokenSource(Timeout.InfiniteTimeSpan, timeProvider);
+            callerCancellation = cancellationToken.UnsafeRegister(
+                static state => ((CancellationTokenSource)state!).Cancel(),
+                source);
+            return source;
+        }
+
+        public void Dispose()
+        {
+            _callerCancellation.Dispose();
+            _source.Dispose();
+        }
     }
 
     private static Exception MapTransportException(

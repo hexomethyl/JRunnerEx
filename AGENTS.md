@@ -36,6 +36,14 @@ then `jrunner-linux-x64.tar.gz` with executable mode and the `linux-x64/` layout
 The publish requires the .NET 10 runtime. Windows CI is advisory legacy-oracle
 coverage in disposable staging, never GUI execution.
 
+Native Ubuntu CI runs its release gate in the digest-pinned .NET 10.0.401 Ubuntu
+24.04 container, then creates and drops to a unique `jrunner` UID/GID `1001`
+with no supplementary groups or capabilities for every
+restore/build/test/publish/smoke/archive command. Keep that image digest and
+the preflight ownership/ancestry assertions synchronized with `global.json`; do
+not run the native closure gate directly on a mutable hosted image or weaken
+static cache closure rules to accommodate its optional libraries.
+
 Generate candidates into an absent directory, never `tests/fixtures/`:
 `dotnet run --project tests/JRunner.FixtureBuilder/JRunner.FixtureBuilder.csproj -- /tmp/jrunner-fixtures`.
 Keep public command/safety changes synchronized with `README.md`.

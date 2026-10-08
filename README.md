@@ -36,7 +36,8 @@ The `jrunner-linux-x64.tar.gz` CI archive contains the published directory benea
 the apphost, and run `./linux-x64/jrunner`; the archive does not bundle the .NET
 runtime or the separately installed XeBuild support payload.
 
-The native Ubuntu 24.04 GitHub Actions job is the release gate: it runs the locked
+The native Ubuntu 24.04 GitHub Actions release gate runs in a digest-pinned
+.NET 10.0.401 Ubuntu container as an unprivileged user. It runs the locked
 restore/build/test/publish sequence above, smokes the published apphost with
 `--help`, and uploads the tar archive with executable mode preserved. The
 separate Windows legacy-oracle job is advisory: it restores and builds the
