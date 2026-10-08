@@ -1,0 +1,95 @@
+{
+  "schemaVersion": 1,
+  "fixtureSet": "jrunner-native-core",
+  "files": [
+    {
+      "path": "keys/small-block.cpukey",
+      "byteLength": 33,
+      "sha256": "BAF30DFF5F3E3FF1DE2629A84A6A898807ECC1E98213E7649474369AF55AE9CC"
+    },
+    {
+      "path": "nand/small-block.bin",
+      "byteLength": 17301504,
+      "sha256": "3D9F07DE389B6E26683110989A39676ABF29A0CF993082848E40ACE5793DAB62"
+    },
+    {
+      "path": "nand/small-block-remapped-equivalent.bin",
+      "byteLength": 17301504,
+      "sha256": "572C8E681AE328963D0A893DAEA2B9ED708A8EAF8584A2FBCD2EBE0C3540FE18"
+    },
+    {
+      "path": "nand/layout1-two-block.bin",
+      "byteLength": 33792,
+      "sha256": "EEC92DC2AD7F99D8976D590919D2AA34F9720B2E8D4BC44E1EB54693097FB8B1"
+    },
+    {
+      "path": "nand/layout2-two-block.bin",
+      "byteLength": 270336,
+      "sha256": "588417A49E25C2668DB3E0785866A3F63EEE172FDEAC801C8C0D25DA76C34C90"
+    },
+    {
+      "path": "patches/patches.bin",
+      "byteLength": 68,
+      "sha256": "A0919AE2C960E3796487A54F4463A4B73490839CED3E562F7210FC4687B03FEA"
+    },
+    {
+      "path": "patches/truncated.bin",
+      "byteLength": 12,
+      "sha256": "82E97883915C240F07A200525E8E81AB0972B8FE929BACD4839870A25BFE70ED"
+    }
+  ],
+  "scenarios": {
+    "nandInspection": {
+      "input": "nand/small-block.bin",
+      "cpuKey": "keys/small-block.cpukey",
+      "format": "interleaved-ecc",
+      "layout": "layout0",
+      "rawByteLength": 17301504,
+      "canonicalLogicalByteLength": 16777216,
+      "cbBuild": 9188,
+      "smcVersion": "1.02",
+      "cpuKeyVerification": "verified",
+      "legacyPatches": [
+        "FuseBlow",
+        "XLUSB",
+        "XLHDD",
+        "UsbdSec",
+        "CoronaKeyFix"
+      ]
+    },
+    "canonicalComparison": {
+      "left": "nand/small-block.bin",
+      "right": "nand/small-block-remapped-equivalent.bin",
+      "layout": "layout0",
+      "badPhysicalBlock": 0,
+      "replacementPhysicalBlock": 1023
+    },
+    "patchInspection": {
+      "completeInput": "patches/patches.bin",
+      "malformedInput": "patches/truncated.bin",
+      "recordCount": 5,
+      "legacyPatches": [
+        "FuseBlow",
+        "XLUSB",
+        "XLHDD",
+        "UsbdSec",
+        "CoronaKeyFix"
+      ],
+      "malformedDiagnosticKind": "truncated-payload"
+    },
+    "physicalFormats": [
+      {
+        "input": "nand/small-block.bin",
+        "layout": "layout0"
+      },
+      {
+        "input": "nand/layout1-two-block.bin",
+        "layout": "layout1"
+      },
+      {
+        "input": "nand/layout2-two-block.bin",
+        "layout": "layout2"
+      }
+    ]
+  }
+}

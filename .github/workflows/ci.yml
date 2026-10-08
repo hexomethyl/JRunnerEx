@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Native Ubuntu
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: 10.0.401
+          cache: true
+          cache-dependency-path: "**/packages.lock.json"
+
+      - name: Restore locked dependencies
+        run: dotnet restore JRunner.Native.sln --locked-mode
+
+      - name: Build native solution
+        run: dotnet build JRunner.Native.sln -c Release --no-restore
+
+      - name: Test native solution
+        run: dotnet test JRunner.Native.sln -c Release --no-build
+
+      - name: Publish Linux CLI
+        run: >-
+          dotnet publish src/JRunner.Cli/JRunner.Cli.csproj -c Release --no-restore
+          -r linux-x64 --self-contained false -o artifacts/linux-x64
+
+      - name: Smoke published apphost
+        run: ./artifacts/linux-x64/jrunner --help
+
+      - name: Archive Linux CLI with executable mode
+        run: tar -C artifacts -czf artifacts/jrunner-linux-x64.tar.gz linux-x64
+
+      - name: Upload Linux CLI archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: jrunner-linux-x64
+          path: artifacts/jrunner-linux-x64.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  legacy-windows-oracle:
+    name: Legacy Windows oracle (advisory)
+    runs-on: windows-2022
+    continue-on-error: true
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3
+
+      - name: Stage legacy solution outside the checkout
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP 'jrunner-legacy-oracle'
+          Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'JRunner.sln') -Destination $stage -Force
+          Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'J-Runner') -Destination (Join-Path $stage 'J-Runner') -Recurse -Force
+
+      - name: Restore legacy packages
+        shell: pwsh
+        working-directory: ${{ runner.temp }}\jrunner-legacy-oracle
+        run: nuget restore .\JRunner.sln -PackagesDirectory .\packages -NonInteractive
+
+      - name: Build legacy compatibility oracle
+        shell: pwsh
+        working-directory: ${{ runner.temp }}\jrunner-legacy-oracle
+        run: msbuild .\JRunner.sln /m /p:Configuration=Release /p:Platform=x86 /p:RestorePackages=false

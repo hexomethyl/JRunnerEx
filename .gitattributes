@@ -3,6 +3,16 @@
 ###############################################################################
 * text=auto
 
+# Deterministic NAND and patch fixtures are binary blobs. Their text companions
+# have manifest-locked LF bytes on every checkout.
+tests/fixtures/**/*.bin binary
+tests/fixtures/keys/*.cpukey text eol=lf
+tests/fixtures/manifest.v1.json text eol=lf
+
+# The embedded support manifest is canonical JSON with LF bytes so its reviewed
+# archive and payload digests are invariant across checkouts.
+packaging/support-manifests/v3.4.0-r7.json text eol=lf
+
 ###############################################################################
 # Set default behavior for command prompt diff.
 #
