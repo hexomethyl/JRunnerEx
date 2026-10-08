@@ -25,6 +25,19 @@ jobs:
           cache: true
           cache-dependency-path: "**/packages.lock.json"
 
+      # Temporary: establish whether the hosted image's loader-cache entry is
+      # outside the protected-native threat model. Remove after diagnosis.
+      - name: Inspect hosted loader-cache roots
+        shell: bash
+        run: |
+          id
+          for path in /usr/local/lib/libsourcekitdInProc.so /usr/local/lib/xeon_phi; do
+            printf '%s\n' "--- $path ---"
+            namei -l -- "$path" || true
+            stat -c '%n type=%F uid=%u gid=%g mode=%a' -- "$path" || true
+            stat -Lc '%n resolved-type=%F uid=%u gid=%g mode=%a' -- "$path" || true
+          done
+
       - name: Restore locked dependencies
         run: dotnet restore JRunner.Native.sln --locked-mode
 
