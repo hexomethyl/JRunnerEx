@@ -1,8 +1,11 @@
 using System.Collections.ObjectModel;
 using System.Diagnostics;
+using System.Globalization;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace JRunner.Cli.Infrastructure;
 
@@ -199,22 +202,305 @@ internal sealed class NativeDependencyClosure
 
     private static NativeDependencyClosure PrepareCore(NativeDependencyClosureSpec spec, NativeLoaderFileSystemLayout layout, bool production)
     {
+        PreparationDiagnostic? diagnostic = null;
         try
         {
+            diagnostic = PreparationDiagnostic.CreateIfEnabled(production);
+            diagnostic?.Stage("PrepareCore.Inputs");
             if (!OperatingSystem.IsLinux() || spec is null || spec.ExecutablePaths.Count == 0)
             {
                 throw NativeElfReader.Failure();
             }
             NativeDependencyClosureSpec inputs = CopyInputs(spec);
+            diagnostic?.Stage("PrepareCore.Layout");
             NativeLoaderFileSystemLayout frozenLayout = CopyLayout(layout);
-            NativeDependencyClosureBinding binding = new Builder(inputs, frozenLayout).Build();
+            diagnostic?.Stage("PrepareCore.Builder");
+            NativeDependencyClosureBinding binding = new Builder(inputs, frozenLayout, diagnostic).Build();
             var closure = new NativeDependencyClosure(inputs, binding, production);
-            closure.ValidateFrozenGraph();
+            diagnostic?.Stage("PrepareCore.ValidateFrozenGraph");
+            closure.ValidateFrozenGraph(diagnostic);
             return closure;
         }
-        catch (Exception)
+        catch (Exception exception)
         {
+            diagnostic?.Report(exception);
             throw NativeElfReader.Failure();
+        }
+    }
+
+    // Temporary, preparation-local CI observer; never retained by a returned closure.
+    private sealed class PreparationDiagnostic
+    {
+        private const string Prefix = "JRUNNER_NATIVE_CLOSURE_DIAGNOSTIC: ";
+        private const int MaximumLineCharacters = 8 * 1024 - 1;
+        private const int MaximumRetainedPathCharacters = 4096;
+        private const int MaximumPathCharacters = 1024;
+        private const int MaximumSourceCharacters = 2560;
+        private const int MaximumCaughtCharacters = 2048;
+        private const int MaximumExceptionDepth = 3;
+        private const int MaximumStackFrames = 16;
+        private readonly Regex _keyText = new(
+            "(?:[0-9a-fA-F]{2}[:\\-\\s]*){16}|(?:[0-9a-fA-F]{2}[:\\-\\s]+){3,}[0-9a-fA-F]{2}|[0-9a-fA-F]{8,}",
+            RegexOptions.CultureInvariant | RegexOptions.NonBacktracking);
+        private string _stage = "PrepareCore";
+        private string? _operation;
+        private string? _path;
+        private string? _canonicalPath;
+        private string? _root;
+        private string? _sourceDetails;
+        private readonly Action<Exception> _originObserver;
+
+        private PreparationDiagnostic()
+        {
+            _originObserver = CaptureOrigin;
+        }
+
+        internal Action<Exception> OriginObserver => _originObserver;
+
+        internal static PreparationDiagnostic? CreateIfEnabled(bool production)
+        {
+            try
+            {
+                return production && string.Equals(Environment.GetEnvironmentVariable("JRUNNER_NATIVE_CLOSURE_DIAGNOSTIC"),
+                    "1", StringComparison.Ordinal) ? new PreparationDiagnostic() : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        internal void Stage(string stage, string? root = null)
+        {
+            try
+            {
+                _stage = stage;
+                _operation = null;
+                if (root is not null)
+                {
+                    _root = RetainPath(root);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        internal void Inspect(string operation, string path, string? canonicalPath = null, string? root = null)
+        {
+            try
+            {
+                _operation = operation;
+                _path = RetainPath(path);
+                _canonicalPath = canonicalPath is null ? null : RetainPath(canonicalPath);
+                if (root is not null)
+                {
+                    _root = RetainPath(root);
+                }
+                _sourceDetails = null;
+            }
+            catch
+            {
+            }
+        }
+
+        internal void InspectBound(string operation, string path, IReadOnlyDictionary<string, NativePathBinding> paths,
+            string? root = null)
+        {
+            try
+            {
+                paths.TryGetValue(path, out NativePathBinding? bound);
+                Inspect(operation, path, bound?.CanonicalPath, root ?? bound?.ExistingAncestor);
+            }
+            catch
+            {
+            }
+        }
+
+        private string RetainPath(string path)
+        {
+            if (path.Length <= MaximumRetainedPathCharacters)
+            {
+                return path;
+            }
+            var text = new StringBuilder(MaximumPathCharacters);
+            if (!AppendSanitized(text, path, MaximumPathCharacters - 3))
+            {
+                text.Append("...");
+            }
+            return text.ToString();
+        }
+
+        private void CaptureOrigin(Exception exception)
+        {
+            try
+            {
+                // Outer resolver catches must not replace the first, deepest source.
+                _sourceDetails ??= DescribeException(exception, "source", MaximumSourceCharacters);
+            }
+            catch
+            {
+            }
+        }
+
+        internal void Report(Exception exception)
+        {
+            try
+            {
+                var text = new StringBuilder(MaximumLineCharacters + 1);
+                text.Append(Prefix);
+                AppendField(text, "stage", _stage, 96, MaximumLineCharacters);
+                AppendField(text, "operation", _operation, 96, MaximumLineCharacters);
+                AppendField(text, "path", _path, MaximumPathCharacters, MaximumLineCharacters);
+                AppendField(text, "canonical", _canonicalPath, MaximumPathCharacters, MaximumLineCharacters);
+                AppendField(text, "root", _root, MaximumPathCharacters, MaximumLineCharacters);
+                text.Append(_sourceDetails);
+                text.Append(DescribeException(exception, "caught",
+                    Math.Min(MaximumCaughtCharacters, MaximumLineCharacters - text.Length)));
+                Console.Error.Write(text.Append('\n').ToString());
+            }
+            catch
+            {
+                // Diagnostics must never change the existing public redacted failure.
+            }
+        }
+
+        private string DescribeException(Exception exception, string label, int maximumCharacters)
+        {
+            var text = new StringBuilder(maximumCharacters);
+            Exception? current = exception;
+            for (int depth = 0; current is not null && depth < MaximumExceptionDepth; depth++)
+            {
+                if (text.Length > maximumCharacters - 96)
+                {
+                    break;
+                }
+                string field = string.Concat(label, depth.ToString(CultureInfo.InvariantCulture));
+                AppendField(text, field + ".type", current.GetType().FullName, 128, maximumCharacters);
+                string hresult = string.Concat(" ", field, ".hresult=0x",
+                    unchecked((uint)current.HResult).ToString("X8", CultureInfo.InvariantCulture));
+                if (text.Length + hresult.Length <= maximumCharacters)
+                {
+                    text.Append(hresult);
+                }
+                var stack = new StackTrace(current, fNeedFileInfo: true);
+                if (text.Length + field.Length + 16 < maximumCharacters)
+                {
+                    text.Append(' ').Append(field).Append(".origin=\"");
+                    int limit = Math.Min(text.Length + 192, maximumCharacters - 1);
+                    if (!AppendMethod(text, current.TargetSite ?? stack.GetFrame(0)?.GetMethod(), limit - 3))
+                    {
+                        text.Append("...");
+                    }
+                    text.Append('"');
+                }
+                if (text.Length + field.Length + 16 < maximumCharacters)
+                {
+                    text.Append(' ').Append(field).Append(".stack=\"");
+                    int limit = Math.Min(text.Length + (depth == 0 ? 1536 : 512), maximumCharacters - 1);
+                    bool complete = true;
+                    int frames = Math.Min(stack.FrameCount, MaximumStackFrames);
+                    for (int index = 0; index < frames; index++)
+                    {
+                        StackFrame? frame = stack.GetFrame(index);
+                        if (index != 0 && !AppendEscaped(text, " | ", limit - 3))
+                        {
+                            complete = false;
+                            break;
+                        }
+                        if (!AppendMethod(text, frame?.GetMethod(), limit - 3) ||
+                            !AppendEscaped(text, " @ ", limit - 3) ||
+                            !AppendSanitized(text, frame?.GetFileName(), limit - 3) ||
+                            !AppendEscaped(text, string.Concat(":", frame?.GetFileLineNumber().ToString(CultureInfo.InvariantCulture),
+                                ":", frame?.GetFileColumnNumber().ToString(CultureInfo.InvariantCulture),
+                                " il=", frame?.GetILOffset().ToString(CultureInfo.InvariantCulture)), limit - 3))
+                        {
+                            complete = false;
+                            break;
+                        }
+                    }
+                    if (!complete || stack.FrameCount > frames)
+                    {
+                        text.Append("...");
+                    }
+                    text.Append('"');
+                }
+                current = current.InnerException;
+            }
+            if (current is not null && text.Length + 21 <= maximumCharacters)
+            {
+                text.Append(" chain_truncated=true");
+            }
+            return text.ToString();
+        }
+
+        private bool AppendMethod(StringBuilder text, MethodBase? method, int limit)
+        {
+            return method is null ? AppendEscaped(text, "-", limit) :
+                AppendSanitized(text, method.DeclaringType?.FullName, limit) &&
+                AppendEscaped(text, ".", limit) && AppendSanitized(text, method.Name, limit);
+        }
+
+        private void AppendField(StringBuilder text, string name, string? value, int fieldCharacters, int maximumCharacters)
+        {
+            if (text.Length + name.Length + 8 > maximumCharacters)
+            {
+                return;
+            }
+            text.Append(' ').Append(name).Append("=\"");
+            int limit = Math.Min(text.Length + fieldCharacters, maximumCharacters - 1);
+            if (!AppendSanitized(text, value, limit - 3))
+            {
+                text.Append("...");
+            }
+            text.Append('"');
+        }
+
+        private bool AppendSanitized(StringBuilder text, string? value, int limit)
+        {
+            if (value is null)
+            {
+                return AppendEscaped(text, "-", limit);
+            }
+            int offset = 0;
+            // Match against the full input before limiting output; never expose a cut-off key prefix.
+            foreach (ValueMatch match in _keyText.EnumerateMatches(value))
+            {
+                if (!AppendEscaped(text, value.AsSpan(offset, match.Index - offset), limit) ||
+                    !AppendEscaped(text, "[redacted]", limit))
+                {
+                    return false;
+                }
+                offset = match.Index + match.Length;
+            }
+            return AppendEscaped(text, value.AsSpan(offset), limit);
+        }
+
+        private static bool AppendEscaped(StringBuilder text, ReadOnlySpan<char> value, int limit)
+        {
+            const string digits = "0123456789ABCDEF";
+            foreach (char character in value)
+            {
+                int count = character is '\\' or '"' ? 2 : character is >= ' ' and <= '~' ? 1 : 6;
+                if (text.Length > limit - count)
+                {
+                    return false;
+                }
+                if (count == 1)
+                {
+                    text.Append(character);
+                }
+                else if (count == 2)
+                {
+                    text.Append('\\').Append(character);
+                }
+                else
+                {
+                    text.Append("\\u").Append(digits[character >> 12]).Append(digits[(character >> 8) & 15])
+                        .Append(digits[(character >> 4) & 15]).Append(digits[character & 15]);
+                }
+            }
+            return true;
         }
     }
 
@@ -483,10 +769,12 @@ internal sealed class NativeDependencyClosure
         }
     }
 
-    private void ValidateFrozenGraph()
+    private void ValidateFrozenGraph(PreparationDiagnostic? diagnostic = null)
     {
+        diagnostic?.Stage("ValidateFrozenGraph.Bounds");
         ValidateBindingBounds(_binding);
-        ValidateEnvironment(_inputs.EnvironmentBindings, _paths);
+        diagnostic?.Stage("ValidateFrozenGraph.Environment");
+        ValidateEnvironment(_inputs.EnvironmentBindings, _paths, diagnostic);
         if (_inputs.EnvironmentBindings.ContainsKey("WINEPREFIX"))
         {
             if (_binding.PrefixPolicy is null || _inputs.PrefixPolicy is null ||
@@ -502,8 +790,10 @@ internal sealed class NativeDependencyClosure
         {
             throw NativeElfReader.Failure();
         }
+        diagnostic?.Stage("ValidateFrozenGraph.Roots");
         foreach (string root in _binding.SearchDirectories)
         {
+            diagnostic?.InspectBound("SearchRoot", root, _paths, root);
             if (!_paths.TryGetValue(root, out NativePathBinding? path) || !path.Directory)
             {
                 throw NativeElfReader.Failure();
@@ -511,6 +801,7 @@ internal sealed class NativeDependencyClosure
         }
         foreach (string root in _binding.RecursiveDirectories)
         {
+            diagnostic?.InspectBound("RecursiveRoot", root, _paths, root);
             if (!_paths.TryGetValue(root, out NativePathBinding? path) || !path.Directory)
             {
                 throw NativeElfReader.Failure();
@@ -520,20 +811,26 @@ internal sealed class NativeDependencyClosure
         {
             foreach (string capability in HardwareCapabilityTreeNames)
             {
-                RequireRecursiveRoot(Path.Join(root, capability));
+                string path = Path.Join(root, capability);
+                diagnostic?.InspectBound("CapabilityRoot", path, _paths, root);
+                RequireRecursiveRoot(path);
             }
         }
         foreach (string root in _binding.LoaderLayout.DefaultDirectories)
         {
+            diagnostic?.InspectBound("DefaultRoot", root, _paths, root);
             RequireSearchRoot(root);
         }
         foreach (string root in _binding.LoaderLayout.GconvDirectories.Concat(_inputs.ModuleDirectories))
         {
+            diagnostic?.InspectBound("ModuleRoot", root, _paths, root);
             RequireRecursiveRoot(root);
         }
+        diagnostic?.Stage("ValidateFrozenGraph.Configurations");
         foreach (string config in _inputs.ConfigurationFiles.Append(_binding.LoaderLayout.CachePath)
             .Append(_binding.LoaderLayout.PreloadPath).Append(_binding.LoaderLayout.ConfigurationPath))
         {
+            diagnostic?.InspectBound("Configuration", config, _paths);
             if (!_paths.TryGetValue(config, out NativePathBinding? path) || path.Directory || !path.FreezeMetadata)
             {
                 throw NativeElfReader.Failure();
@@ -545,6 +842,7 @@ internal sealed class NativeDependencyClosure
         }
         if (_binding.LoaderLayout.NssConfigurationPath is string nss)
         {
+            diagnostic?.InspectBound("NssConfiguration", nss, _paths);
             if (!_paths.TryGetValue(nss, out NativePathBinding? nssConfigurationBinding) ||
                 nssConfigurationBinding.Directory || !nssConfigurationBinding.FreezeMetadata)
             {
@@ -555,8 +853,10 @@ internal sealed class NativeDependencyClosure
                 RequireBoundFile(nss);
             }
         }
+        diagnostic?.Stage("ValidateFrozenGraph.Paths");
         foreach (NativePathBinding path in _binding.Paths)
         {
+            diagnostic?.Inspect("PathBinding", path.AliasPath, path.CanonicalPath, path.ExistingAncestor);
             RequireAbsoluteAlias(path.AliasPath);
             // An absent alias retains the unresolved suffix after its protected
             // existing ancestor. Never collapse missing/../target into a target.
@@ -579,8 +879,10 @@ internal sealed class NativeDependencyClosure
         }
         var metadataBoundFiles = new HashSet<(string Path, NativeFileIdentity Identity)>();
         var recursiveRoots = new HashSet<string>(_binding.RecursiveDirectories, StringComparer.Ordinal);
+        diagnostic?.Stage("ValidateFrozenGraph.PathObjects");
         foreach (NativePathBinding path in _binding.Paths)
         {
+            diagnostic?.Inspect("PathObject", path.AliasPath, path.CanonicalPath, path.ExistingAncestor);
             if (path.Exists && !path.Directory && path.FreezeMetadata)
             {
                 metadataBoundFiles.Add((path.CanonicalPath, path.Identity));
@@ -592,13 +894,15 @@ internal sealed class NativeDependencyClosure
                     }
                     if (item.Image is NativeElfImageBinding image)
                     {
-                        RequireImageAliasPaths(path, image);
+                        RequireImageAliasPaths(path, image, diagnostic);
                     }
                 }
             }
         }
+        diagnostic?.Stage("ValidateFrozenGraph.Objects");
         foreach (NativeObjectBinding item in _binding.Objects)
         {
+            diagnostic?.InspectBound("ObjectBinding", item.CanonicalPath, _paths);
             RequireLiteralAbsolutePath(item.CanonicalPath);
             ValidateIdentity(item.Identity, directory: false);
             bool validProtection = item.Protection switch
@@ -621,6 +925,7 @@ internal sealed class NativeDependencyClosure
             }
             if (item.Script)
             {
+                diagnostic?.InspectBound("ScriptInterpreter", "/bin/sh", _paths);
                 RequireBoundFile("/bin/sh");
                 if (!_executableAliases.Contains("/bin/sh"))
                 {
@@ -628,8 +933,10 @@ internal sealed class NativeDependencyClosure
                 }
             }
         }
+        diagnostic?.Stage("ValidateFrozenGraph.Cache");
         foreach (NativeLoaderCacheEntry entry in _binding.CacheEntries)
         {
+            diagnostic?.InspectBound("CacheCandidate", entry.Path, _paths);
             RequireLiteralAbsolutePath(entry.Path);
             RequireSearchRoot(Path.GetDirectoryName(entry.Path)!);
             if (!_paths.TryGetValue(entry.Path, out NativePathBinding? candidate) || candidate.Directory || !candidate.FreezeMetadata ||
@@ -638,13 +945,16 @@ internal sealed class NativeDependencyClosure
                 throw NativeElfReader.Failure();
             }
         }
+        diagnostic?.InspectBound("PreloadPresence", _binding.LoaderLayout.PreloadPath, _paths);
         if (!_paths.TryGetValue(_binding.LoaderLayout.PreloadPath, out NativePathBinding? preload) ||
             preload.Exists != _binding.PreloadExists)
         {
             throw NativeElfReader.Failure();
         }
+        diagnostic?.Stage("ValidateFrozenGraph.Executables");
         foreach (string executable in _inputs.ExecutablePaths)
         {
+            diagnostic?.InspectBound("Executable", executable, _paths, executable);
             if (!_paths.TryGetValue(executable, out NativePathBinding? path) || !path.Exists || path.Directory ||
                 !_objects.TryGetValue(path.CanonicalPath, out NativeObjectBinding? item))
             {
@@ -652,12 +962,15 @@ internal sealed class NativeDependencyClosure
             }
             ValidateExecutableObject(item);
         }
+        diagnostic?.Stage("ValidateFrozenGraph.Gconv");
         foreach (string module in _binding.GconvModulePaths)
         {
+            diagnostic?.InspectBound("GconvModule", module, _paths);
             RequireAbsoluteAlias(module);
             RequireBoundFile(module);
         }
-        ValidateDependencies();
+        diagnostic?.Stage("ValidateFrozenGraph.Dependencies");
+        ValidateDependencies(diagnostic);
     }
 
     private void RequireSearchRoot(string root)
@@ -698,9 +1011,11 @@ internal sealed class NativeDependencyClosure
         }
     }
 
-    private static string RequireAliasOriginDirectory(string alias, IReadOnlyDictionary<string, NativePathBinding> paths)
+    private static string RequireAliasOriginDirectory(string alias, IReadOnlyDictionary<string, NativePathBinding> paths,
+        PreparationDiagnostic? diagnostic = null)
     {
         string parent = Path.GetDirectoryName(alias) ?? throw NativeElfReader.Failure();
+        diagnostic?.InspectBound("AliasOriginDirectory", parent, paths, parent);
         if (!paths.TryGetValue(parent, out NativePathBinding? bound) || !bound.Directory || !bound.Exists ||
             !paths.TryGetValue(bound.CanonicalPath, out NativePathBinding? canonical) ||
             !canonical.Directory || !canonical.Exists || !SameNode(bound.Identity, canonical.Identity))
@@ -710,14 +1025,14 @@ internal sealed class NativeDependencyClosure
         return bound.CanonicalPath;
     }
 
-    private void RequireImageAliasPaths(NativePathBinding path, NativeElfImageBinding image)
+    private void RequireImageAliasPaths(NativePathBinding path, NativeElfImageBinding image, PreparationDiagnostic? diagnostic = null)
     {
-        string targetOrigin = RequireAliasOriginDirectory(path.CanonicalPath, _paths);
-        string aliasOrigin = RequireAliasOriginDirectory(path.AliasPath, _paths);
-        CloseImagePaths(targetOrigin, image, RequireSearchRoot, RequireCandidateFile);
+        string targetOrigin = RequireAliasOriginDirectory(path.CanonicalPath, _paths, diagnostic);
+        string aliasOrigin = RequireAliasOriginDirectory(path.AliasPath, _paths, diagnostic);
+        CloseImagePaths(targetOrigin, image, RequireSearchRoot, RequireCandidateFile, diagnostic);
         if (aliasOrigin != targetOrigin)
         {
-            CloseImagePaths(aliasOrigin, image, RequireSearchRoot, RequireCandidateFile);
+            CloseImagePaths(aliasOrigin, image, RequireSearchRoot, RequireCandidateFile, diagnostic);
         }
     }
 
@@ -853,11 +1168,12 @@ internal sealed class NativeDependencyClosure
         return text[start..position];
     }
 
-    private void ValidateDependencies()
+    private void ValidateDependencies(PreparationDiagnostic? diagnostic = null)
     {
         var candidates = CollectLibraryCandidates(_paths, _objects, _binding.CacheEntries);
-        foreach (string canonical in GetContentFrozenObjects(_inputs.ExecutablePaths, _binding.NssServices, _paths, _objects, candidates))
+        foreach (string canonical in GetContentFrozenObjects(_inputs.ExecutablePaths, _binding.NssServices, _paths, _objects, candidates, diagnostic))
         {
+            diagnostic?.InspectBound("ContentFrozenObject", canonical, _paths);
             RequireContentFrozen(_objects[canonical]);
         }
         HashSet<string> unresolved = GetUnresolvedDependencyNames(_objects.Values, candidates);
@@ -870,7 +1186,9 @@ internal sealed class NativeDependencyClosure
         {
             foreach (string directory in directories)
             {
-                RequireCandidateFile(Path.Join(directory, name), required: false);
+                string path = Path.Join(directory, name);
+                diagnostic?.InspectBound("DependencyCandidate", path, _paths, directory);
+                RequireCandidateFile(path, required: false);
             }
         }
         // Existing capability trees also freeze their entry inventories. A new
@@ -880,6 +1198,7 @@ internal sealed class NativeDependencyClosure
         HashSet<string> capabilities = GetCapabilityRoots(_binding.SearchDirectories);
         foreach (NativePathBinding path in _binding.Paths)
         {
+            diagnostic?.Inspect("CapabilityInventory", path.AliasPath, path.CanonicalPath, path.ExistingAncestor);
             if (path.Directory && path.Exists && IsWithinRoot(path.AliasPath, capabilities) &&
                 !inventories.Contains(path.CanonicalPath))
             {
@@ -891,13 +1210,15 @@ internal sealed class NativeDependencyClosure
     private static HashSet<string> GetContentFrozenObjects(
         IReadOnlyList<string> executablePaths, IReadOnlyList<string> nssServices,
         IReadOnlyDictionary<string, NativePathBinding> paths, IReadOnlyDictionary<string, NativeObjectBinding> objects,
-        Dictionary<(string Name, byte ElfClass, ushort Machine), HashSet<string>> candidates)
+        Dictionary<(string Name, byte ElfClass, ushort Machine), HashSet<string>> candidates,
+        PreparationDiagnostic? diagnostic = null)
     {
         var frozen = new HashSet<string>(StringComparer.Ordinal);
         var required = new HashSet<string>(StringComparer.Ordinal);
         var pending = new Queue<(string Path, bool Required)>();
         foreach (string executable in executablePaths)
         {
+            diagnostic?.InspectBound("ContentRootExecutable", executable, paths, executable);
             EnqueueContentFrozenObject(paths[executable].CanonicalPath, true, frozen, required, pending);
         }
         foreach (NativeObjectBinding item in objects.Values)
@@ -930,6 +1251,7 @@ internal sealed class NativeDependencyClosure
         // retain absence anchors; only executable-reachable edges must resolve.
         while (pending.TryDequeue(out var next))
         {
+            diagnostic?.InspectBound("ContentDependencyObject", next.Path, paths);
             if (!next.Required && required.Contains(next.Path))
             {
                 continue;
@@ -941,11 +1263,13 @@ internal sealed class NativeDependencyClosure
             }
             if (image.Interpreter is string interpreter)
             {
+                diagnostic?.InspectBound("ContentDependencyInterpreter", interpreter, paths);
                 EnqueueContentFrozenObject(paths[interpreter].CanonicalPath, next.Required, frozen, required, pending);
             }
             HashSet<string>? origins = null;
             foreach (string name in image.Needed)
             {
+                diagnostic?.InspectBound("DependencyConsumer", next.Path, paths);
                 if (!name.Contains('/') && !name.Contains('$'))
                 {
                     if (!candidates.TryGetValue((name, image.ElfClass, image.Machine), out HashSet<string>? matches))
@@ -970,19 +1294,19 @@ internal sealed class NativeDependencyClosure
                         {
                             if (alias.Exists && !alias.Directory && alias.CanonicalPath == next.Path)
                             {
-                                origins.Add(RequireAliasOriginDirectory(alias.AliasPath, paths));
+                                origins.Add(RequireAliasOriginDirectory(alias.AliasPath, paths, diagnostic));
                             }
                         }
                     }
                     foreach (string origin in origins)
                     {
                         FollowNeededCandidate(ExpandOriginPath(origin, name), image, next.Required, paths, objects,
-                            frozen, required, pending);
+                            frozen, required, pending, diagnostic);
                     }
                 }
                 else
                 {
-                    FollowNeededCandidate(name, image, next.Required, paths, objects, frozen, required, pending);
+                    FollowNeededCandidate(name, image, next.Required, paths, objects, frozen, required, pending, diagnostic);
                 }
             }
         }
@@ -991,8 +1315,10 @@ internal sealed class NativeDependencyClosure
 
     private static void FollowNeededCandidate(string alias, NativeElfImageBinding consumer, bool requireExistence,
         IReadOnlyDictionary<string, NativePathBinding> paths, IReadOnlyDictionary<string, NativeObjectBinding> objects,
-        HashSet<string> frozen, HashSet<string> required, Queue<(string Path, bool Required)> pending)
+        HashSet<string> frozen, HashSet<string> required, Queue<(string Path, bool Required)> pending,
+        PreparationDiagnostic? diagnostic = null)
     {
+        diagnostic?.InspectBound("NeededCandidate", alias, paths);
         if (!paths.TryGetValue(alias, out NativePathBinding? path) || !path.Exists || path.Directory ||
             !objects.TryGetValue(path.CanonicalPath, out NativeObjectBinding? item))
         {
@@ -1183,11 +1509,12 @@ internal sealed class NativeDependencyClosure
     }
 
     private static void CloseImagePaths(string originDirectory, NativeElfImageBinding image,
-        Action<string> addRoot, Action<string, bool> addFile)
+        Action<string> addRoot, Action<string, bool> addFile, PreparationDiagnostic? diagnostic = null)
     {
         if (image.Interpreter is not null)
         {
             RequireLiteralAbsolutePath(image.Interpreter);
+            diagnostic?.Inspect("ImageInterpreter", image.Interpreter, root: originDirectory);
             string name = Path.GetFileName(image.Interpreter);
             if (IsCurrentRuntimeImage(image) && ((image.Machine == 62 && name != "ld-linux-x86-64.so.2") ||
                 (image.Machine == 3 && name != "ld-linux.so.2")))
@@ -1200,14 +1527,19 @@ internal sealed class NativeDependencyClosure
         {
             // NativeElfReader already splits path tags on ':', retaining empty
             // components. Empty components select cwd and are unsupported.
-            addRoot(ExpandOriginPath(originDirectory, component));
+            string path = ExpandOriginPath(originDirectory, component);
+            diagnostic?.Inspect("ImageSearchRoot", path, root: originDirectory);
+            addRoot(path);
         }
         foreach (string needed in image.Needed)
         {
             if (needed.Contains('/') || needed.Contains('$'))
             {
                 string path = ExpandOriginPath(originDirectory, needed);
-                addRoot(Path.GetDirectoryName(path)!);
+                string directory = Path.GetDirectoryName(path)!;
+                diagnostic?.Inspect("ImageDependencyRoot", directory, root: originDirectory);
+                addRoot(directory);
+                diagnostic?.Inspect("ImageDependency", path, root: originDirectory);
                 addFile(path, false);
             }
         }
@@ -1332,7 +1664,8 @@ internal sealed class NativeDependencyClosure
         };
     }
 
-    private static void ValidateEnvironment(IReadOnlyDictionary<string, string> environment, IReadOnlyDictionary<string, NativePathBinding> paths)
+    private static void ValidateEnvironment(IReadOnlyDictionary<string, string> environment,
+        IReadOnlyDictionary<string, NativePathBinding> paths, PreparationDiagnostic? diagnostic = null)
     {
         foreach (string required in new[] { "HOME", "PATH", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME" })
         {
@@ -1350,6 +1683,7 @@ internal sealed class NativeDependencyClosure
             }
             if (value.StartsWith('/'))
             {
+                diagnostic?.InspectBound("ValidateEnvironmentDirectory", value, paths, value);
                 RequireLiteralAbsolutePath(value);
                 if (!paths.TryGetValue(value, out NativePathBinding? path) || !path.Directory || !path.Exists ||
                     (path.Identity.Mode & GroupOtherPermissions) != 0)
@@ -1362,11 +1696,13 @@ internal sealed class NativeDependencyClosure
                 }
             }
         }
+        diagnostic?.InspectBound("ValidatePrivateModules", privateModules, paths, privateModules);
         if (!paths.TryGetValue(privateModules, out NativePathBinding? modules) || !modules.Directory)
         {
             throw NativeElfReader.Failure();
         }
         string openSslConfiguration = Path.Join(environment["HOME"], "native-openssl.cnf");
+        diagnostic?.InspectBound("ValidatePrivateOpenSslConfiguration", openSslConfiguration, paths);
         if (!paths.TryGetValue(openSslConfiguration, out NativePathBinding? openssl) || !openssl.Exists || openssl.Directory ||
             !openssl.FreezeMetadata || openssl.Identity.Size != 0)
         {
@@ -1624,13 +1960,16 @@ internal sealed class NativeDependencyClosure
         }
     }
 
-    private static string[] ReadEntryNames(string protectedDirectory)
+    private static string[] ReadEntryNames(string protectedDirectory, PreparationDiagnostic? diagnostic = null)
     {
-        string canonical = WineXeBuildToolchainResolver.GetProtectedCanonicalPath(protectedDirectory, directory: true);
+        diagnostic?.Inspect("ResolveDirectoryInventory", protectedDirectory, root: protectedDirectory);
+        string canonical = WineXeBuildToolchainResolver.GetProtectedCanonicalPath(protectedDirectory, true, diagnostic?.OriginObserver);
+        diagnostic?.Inspect("EnumerateDirectoryInventory", protectedDirectory, canonical, protectedDirectory);
         var result = new List<string>();
         long characters = 0;
         foreach (string entry in Directory.EnumerateFileSystemEntries(canonical))
         {
+            diagnostic?.Inspect("DirectoryInventoryEntry", entry, root: protectedDirectory);
             string name = Path.GetFileName(entry);
             RequireBareName(name);
             if (result.Count >= MaximumPaths || (characters += name.Length) > MaximumMetadataCharacters)
@@ -1643,7 +1982,8 @@ internal sealed class NativeDependencyClosure
         return result.ToArray();
     }
 
-    private sealed class Builder(NativeDependencyClosureSpec inputs, NativeLoaderFileSystemLayout layout)
+    private sealed class Builder(NativeDependencyClosureSpec inputs, NativeLoaderFileSystemLayout layout,
+        PreparationDiagnostic? diagnostic = null)
     {
         private readonly Dictionary<string, NativePathBinding> _paths = new(StringComparer.Ordinal);
         private readonly Dictionary<string, NativeObjectBinding> _objects = new(StringComparer.Ordinal);
@@ -1670,16 +2010,20 @@ internal sealed class NativeDependencyClosure
 
         internal NativeDependencyClosureBinding Build()
         {
+            diagnostic?.Stage("Builder.SearchRoots");
             foreach (string root in layout.DefaultDirectories)
             {
                 AddDirectory(root);
             }
+            diagnostic?.Stage("Builder.RecursiveRoots");
             foreach (string root in layout.GconvDirectories.Concat(inputs.ModuleDirectories))
             {
                 AddRecursiveDirectory(root);
             }
+            diagnostic?.Stage("Builder.ConfigurationRoots");
             foreach (string path in inputs.ConfigurationFiles)
             {
+                diagnostic?.Inspect("ConfigurationRoot", path, root: path);
                 ProtectConfiguration(path);
             }
             foreach (string executable in inputs.ExecutablePaths)
@@ -1692,10 +2036,11 @@ internal sealed class NativeDependencyClosure
             ParseLoaderConfiguration(layout.ConfigurationPath, 0);
             if (layout.NssConfigurationPath is string nssPath)
             {
+                diagnostic?.Stage("Builder.NssConfiguration", nssPath);
                 NativePathBinding nss = ProtectConfiguration(nssPath);
                 if (nss.Exists)
                 {
-                    _nssServices = ParseNssServices(ReadConfigurationLines(nss));
+                    _nssServices = ParseNssServices(ReadConfigurationLines(nss, diagnostic));
                 }
             }
             foreach (string root in layout.GconvDirectories)
@@ -1705,6 +2050,7 @@ internal sealed class NativeDependencyClosure
             DrainGraph();
             FreezeOptionalDependencyCandidates();
             FreezeContentDependencies();
+            diagnostic?.Stage("Builder.FreezeBinding");
             NativeDependencyClosureSpecBinding inputBinding = BindInputs(inputs);
             var binding = new NativeDependencyClosureBinding
             {
@@ -1725,10 +2071,12 @@ internal sealed class NativeDependencyClosure
 
         private void PrepareEnvironment()
         {
+            diagnostic?.Stage("Builder.PrepareEnvironment");
             foreach ((string _, string value) in inputs.EnvironmentBindings)
             {
                 if (value.StartsWith('/'))
                 {
+                    diagnostic?.Inspect("EnvironmentDirectory", value, root: value);
                     BindPath(value, directory: true, freezeMetadata: false);
                 }
             }
@@ -1738,12 +2086,18 @@ internal sealed class NativeDependencyClosure
                 throw NativeElfReader.Failure();
             }
             AddDirectory(helperPath);
+            if (inputs.PrefixPolicy is not null)
+            {
+                diagnostic?.Inspect("RevalidatePrefixPolicy", inputs.PrefixPolicy.PrefixDirectory,
+                    root: inputs.PrefixPolicy.PrefixDirectory);
+            }
             inputs.PrefixPolicy?.Revalidate();
             string privateModules = Path.Join(home, "native-modules");
+            diagnostic?.Inspect("PrivateModuleDirectory", privateModules, root: privateModules);
             NativePathBinding modules = BindPath(privateModules, directory: true, freezeMetadata: false);
             if (modules.Exists)
             {
-                if ((modules.Identity.Mode & GroupOtherPermissions) != 0 || ReadEntryNames(privateModules).Length != 0)
+                if ((modules.Identity.Mode & GroupOtherPermissions) != 0 || ReadEntryNames(privateModules, diagnostic).Length != 0)
                 {
                     throw NativeElfReader.Failure();
                 }
@@ -1762,14 +2116,15 @@ internal sealed class NativeDependencyClosure
 
         private void ReadCache()
         {
+            diagnostic?.Stage("Builder.ReadCache", layout.CachePath);
             NativePathBinding cache = ProtectConfiguration(layout.CachePath);
             if (!cache.Exists)
             {
                 return;
             }
-            using FileStream stream = OpenBound(cache);
+            using FileStream stream = OpenBound(cache, diagnostic);
             NativeLoaderCacheImage image = NativeLoaderCacheReader.Read(stream);
-            RequireUnchanged(stream, cache.Identity);
+            RequireUnchanged(stream, cache.Identity, diagnostic);
             _cacheEntries = image.Entries.ToArray();
             _hardwareNames = image.HardwareCapabilityNames.ToArray();
             foreach (NativeLoaderCacheEntry entry in _cacheEntries)
@@ -1781,13 +2136,14 @@ internal sealed class NativeDependencyClosure
 
         private void ReadPreload()
         {
+            diagnostic?.Stage("Builder.ReadPreload", layout.PreloadPath);
             NativePathBinding preload = ProtectConfiguration(layout.PreloadPath);
             _preloadExists = preload.Exists;
             if (!preload.Exists)
             {
                 return;
             }
-            foreach (string line in ReadConfigurationLines(preload))
+            foreach (string line in ReadConfigurationLines(preload, diagnostic))
             {
                 if (StripComment(line).Length != 0)
                 {
@@ -1802,6 +2158,8 @@ internal sealed class NativeDependencyClosure
 
         private void ParseLoaderConfiguration(string path, int depth)
         {
+            diagnostic?.Stage("Builder.ParseLoaderConfiguration", path);
+            diagnostic?.Inspect("LoaderConfigurationDepth", path, root: path);
             if (depth >= MaximumConfigurationDepth)
             {
                 throw NativeElfReader.Failure();
@@ -1816,8 +2174,10 @@ internal sealed class NativeDependencyClosure
             // supported; no execution, relative include, hwcap directive or
             // unknown selector is interpreted as harmless data.
             // https://github.com/bminor/glibc/blob/glibc-2.39/elf/ldconfig.c
-            foreach (string source in ReadConfigurationLines(config))
+            foreach (string source in ReadConfigurationLines(config, diagnostic))
             {
+                diagnostic?.Stage("Builder.ParseLoaderConfiguration", config.AliasPath);
+                diagnostic?.Inspect("LoaderConfigurationLine", config.AliasPath, config.CanonicalPath, config.AliasPath);
                 string line = StripComment(source);
                 if (line.Length == 0)
                 {
@@ -1863,6 +2223,7 @@ internal sealed class NativeDependencyClosure
 
         private void ParseGconvDirectory(string directory)
         {
+            diagnostic?.Stage("Builder.ParseGconvDirectory", directory);
             NativePathBinding root = BindPath(directory, true, false);
             NativePathBinding primary = ProtectConfiguration(Path.Join(directory, "gconv-modules"));
             if (primary.Exists)
@@ -1889,6 +2250,8 @@ internal sealed class NativeDependencyClosure
 
         private void ParseGconvConfiguration(NativePathBinding config, string moduleRoot)
         {
+            diagnostic?.Stage("Builder.ParseGconvConfiguration", moduleRoot);
+            diagnostic?.Inspect("GconvConfiguration", config.AliasPath, config.CanonicalPath, moduleRoot);
             if (!_parsedConfigurations.Add(config.CanonicalPath))
             {
                 return;
@@ -1899,8 +2262,9 @@ internal sealed class NativeDependencyClosure
             // https://github.com/bminor/glibc/blob/glibc-2.39/iconv/gconv_conf.c
             // https://github.com/bminor/glibc/blob/glibc-2.39/iconv/gconv_parseconfdir.h
             Span<Range> fields = stackalloc Range[5];
-            foreach (string source in ReadConfigurationLines(config))
+            foreach (string source in ReadConfigurationLines(config, diagnostic))
             {
+                diagnostic?.Inspect("GconvConfigurationLine", config.AliasPath, config.CanonicalPath, moduleRoot);
                 int comment = source.IndexOf('#');
                 ReadOnlySpan<char> line = (comment < 0 ? source.AsSpan() : source.AsSpan(0, comment)).Trim();
                 if (line.IsEmpty)
@@ -1965,6 +2329,7 @@ internal sealed class NativeDependencyClosure
 
         private void AddDirectory(string path)
         {
+            diagnostic?.Inspect("AddDirectory", path, root: path);
             RequireAbsoluteAlias(path);
             if (_searchDirectories.Add(path))
             {
@@ -1979,6 +2344,7 @@ internal sealed class NativeDependencyClosure
 
         private void AddRecursiveDirectory(string path, bool capability = false)
         {
+            diagnostic?.Inspect("AddRecursiveDirectory", path, root: path);
             RequireAbsoluteAlias(path);
             bool added = _recursiveDirectories.Add(path);
             bool newCapability = capability && _capabilityRoots.Add(path);
@@ -2006,6 +2372,7 @@ internal sealed class NativeDependencyClosure
             {
                 while (_pendingFiles.TryDequeue(out var pending))
                 {
+                    diagnostic?.InspectBound("QueuedFile", pending.Path, _paths, pending.Path);
                     InspectFile(pending.Path, pending.Executable, pending.Required, pending.FreezeContent);
                     if (!pending.Executable && _paths.TryGetValue(pending.Path, out NativePathBinding? candidate) &&
                         candidate.Exists && !_objects.ContainsKey(candidate.CanonicalPath))
@@ -2017,6 +2384,7 @@ internal sealed class NativeDependencyClosure
                 }
                 if (_pendingDirectories.TryDequeue(out var directory))
                 {
+                    diagnostic?.Inspect("QueuedDirectory", directory.Path, root: directory.Path);
                     WalkDirectory(directory.Path, directory.Recursive, directory.Capability);
                 }
             }
@@ -2024,8 +2392,9 @@ internal sealed class NativeDependencyClosure
 
         private void FreezeContentDependencies()
         {
+            diagnostic?.Stage("Builder.FreezeContentDependencies");
             var candidates = CollectLibraryCandidates(_paths, _objects, _cacheEntries);
-            foreach (string canonical in GetContentFrozenObjects(inputs.ExecutablePaths, _nssServices, _paths, _objects, candidates))
+            foreach (string canonical in GetContentFrozenObjects(inputs.ExecutablePaths, _nssServices, _paths, _objects, candidates, diagnostic))
             {
                 PromoteContent(_objects[canonical]);
             }
@@ -2035,6 +2404,7 @@ internal sealed class NativeDependencyClosure
         {
             while (true)
             {
+                diagnostic?.Stage("Builder.FreezeOptionalDependencyCandidates");
                 int roots = _searchDirectories.Count;
                 int objects = _objects.Count;
                 var candidates = CollectLibraryCandidates(_paths, _objects, _cacheEntries);
@@ -2046,7 +2416,9 @@ internal sealed class NativeDependencyClosure
                     {
                         foreach (string directory in directories)
                         {
-                            ProtectConfiguration(Path.Join(directory, name));
+                            string path = Path.Join(directory, name);
+                            diagnostic?.Inspect("OptionalDependencyCandidate", path, root: directory);
+                            ProtectConfiguration(path);
                         }
                     }
                 }
@@ -2060,6 +2432,7 @@ internal sealed class NativeDependencyClosure
 
         private void WalkDirectory(string path, bool recursive, bool capability)
         {
+            diagnostic?.Stage("Builder.WalkDirectory", path);
             NativePathBinding root = BindPath(path, true, false);
             if (!root.Exists)
             {
@@ -2078,8 +2451,13 @@ internal sealed class NativeDependencyClosure
             {
                 AddRecursiveDirectory(root.CanonicalPath, capability);
             }
+            if (inputs.PrefixPolicy is not null)
+            {
+                diagnostic?.Inspect("PrefixCanonicalDirectory", inputs.PrefixPolicy.PrefixDirectory, root: path);
+            }
             if (inputs.PrefixPolicy is not null &&
-                root.CanonicalPath == WineXeBuildToolchainResolver.GetProtectedCanonicalPath(inputs.PrefixPolicy.PrefixDirectory, directory: true))
+                root.CanonicalPath == WineXeBuildToolchainResolver.GetProtectedCanonicalPath(inputs.PrefixPolicy.PrefixDirectory,
+                    true, diagnostic?.OriginObserver))
             {
                 if (inputs.ModuleDirectories.Contains(path, StringComparer.Ordinal))
                 {
@@ -2090,6 +2468,7 @@ internal sealed class NativeDependencyClosure
                 // Files/c: code roots are visited independently.
                 return;
             }
+            diagnostic?.Inspect("WalkDirectory", root.AliasPath, root.CanonicalPath, path);
             var node = (root.Identity.DeviceMajor, root.Identity.DeviceMinor, root.Identity.Inode);
             bool firstVisit = recursive ? _visitedRecursiveDirectories.Add(node) :
                 (!_visitedRecursiveDirectories.Contains(node) && _visitedDirectories.Add(node));
@@ -2106,8 +2485,10 @@ internal sealed class NativeDependencyClosure
             if (!_directoryEntries.TryGetValue(node, out var entries))
             {
                 entries = [];
+                diagnostic?.Inspect("EnumerateDirectory", root.AliasPath, root.CanonicalPath, path);
                 foreach (string entry in Directory.EnumerateFileSystemEntries(root.CanonicalPath))
                 {
+                    diagnostic?.Inspect("DirectoryEntryAttributes", entry, root: path);
                     if (entries.Count >= MaximumPaths)
                     {
                         throw NativeElfReader.Failure();
@@ -2125,11 +2506,13 @@ internal sealed class NativeDependencyClosure
             }
             foreach ((string entry, FileAttributes attributes) in entries)
             {
+                diagnostic?.Inspect("DirectoryEntry", entry, root: path);
                 if (++_entries > MaximumPaths)
                 {
                     throw NativeElfReader.Failure();
                 }
                 string alias = Path.Join(path, Path.GetFileName(entry));
+                diagnostic?.Inspect("DirectoryEntryAlias", alias, root: path);
                 if ((attributes & FileAttributes.Directory) != 0)
                 {
                     NativePathBinding child = BindPath(alias, true, false);
@@ -2152,24 +2535,26 @@ internal sealed class NativeDependencyClosure
 
         private NativeObjectBinding PromoteContent(NativeObjectBinding item)
         {
+            diagnostic?.InspectBound("PromoteContent", item.CanonicalPath, _paths);
             if (item.Protection == NativeObjectProtection.ContentFrozen)
             {
                 return item;
             }
-            using FileStream stream = WineXeBuildToolchainResolver.OpenProtectedRead(item.CanonicalPath);
-            RequireUnchanged(stream, item.Identity);
+            using FileStream stream = WineXeBuildToolchainResolver.OpenProtectedRead(item.CanonicalPath, diagnostic?.OriginObserver);
+            RequireUnchanged(stream, item.Identity, diagnostic);
             NativeObjectBinding frozen = item with
             {
                 Protection = NativeObjectProtection.ContentFrozen,
                 ContentSha256 = HashFile(stream),
             };
-            RequireUnchanged(stream, item.Identity);
+            RequireUnchanged(stream, item.Identity, diagnostic);
             _objects[item.CanonicalPath] = frozen;
             return frozen;
         }
 
         private void InspectFile(string path, bool executable, bool required, bool freezeContent = false, bool retainAlias = true)
         {
+            diagnostic?.Stage("Builder.InspectFile");
             NativePathBinding proof = ProbePath(path, directory: false, freezeMetadata: true);
             if (!proof.Exists)
             {
@@ -2205,7 +2590,7 @@ internal sealed class NativeDependencyClosure
                 }
                 return;
             }
-            using FileStream stream = OpenBound(proof);
+            using FileStream stream = OpenBound(proof, diagnostic);
             NativeElfImage? native = executable ? NativeElfReader.Read(stream) : NativeElfReader.ReadModuleMetadata(stream);
             bool portable = native is null && HasPortableExecutableMagic(stream);
             bool script = false;
@@ -2221,7 +2606,7 @@ internal sealed class NativeDependencyClosure
             }
             if (native is null && !script && !portable)
             {
-                RequireUnchanged(stream, proof.Identity);
+                RequireUnchanged(stream, proof.Identity, diagnostic);
                 if (retainAlias)
                 {
                     StorePath(proof with { FreezeMetadata = false });
@@ -2242,7 +2627,7 @@ internal sealed class NativeDependencyClosure
             var item = new NativeObjectBinding(proof.CanonicalPath, proof.Identity, protection,
                 protection == NativeObjectProtection.ContentFrozen ? HashFile(stream) : null, image, script, portable,
                 image is not null && IsCurrentRuntimeImage(image));
-            RequireUnchanged(stream, proof.Identity);
+            RequireUnchanged(stream, proof.Identity, diagnostic);
             AccountObject(item);
             _objects.Add(item.CanonicalPath, item);
             StorePath(proof);
@@ -2259,7 +2644,7 @@ internal sealed class NativeDependencyClosure
                 if (image.Interpreter is not null)
                 {
                     NativePathBinding interpreter = ProbePath(image.Interpreter, false, true);
-                    using FileStream loader = OpenBound(interpreter);
+                    using FileStream loader = OpenBound(interpreter, diagnostic);
                     NativeElfImage? loaderImage;
                     if (IsCurrentRuntimeImage(image))
                     {
@@ -2278,7 +2663,7 @@ internal sealed class NativeDependencyClosure
                     {
                         throw NativeElfReader.Failure();
                     }
-                    RequireUnchanged(loader, interpreter.Identity);
+                    RequireUnchanged(loader, interpreter.Identity, diagnostic);
                 }
             }
         }
@@ -2303,10 +2688,10 @@ internal sealed class NativeDependencyClosure
             BindPath(targetOrigin, true, false);
             BindPath(proof.CanonicalPath, false, true);
             _processedImageAliases.Add(proof.CanonicalPath);
-            CloseImagePaths(targetOrigin, image, AddDirectory, EnqueueDependency);
+            CloseImagePaths(targetOrigin, image, AddDirectory, EnqueueDependency, diagnostic);
             if (parent.CanonicalPath != targetOrigin)
             {
-                CloseImagePaths(parent.CanonicalPath, image, AddDirectory, EnqueueDependency);
+                CloseImagePaths(parent.CanonicalPath, image, AddDirectory, EnqueueDependency, diagnostic);
             }
         }
 
@@ -2315,14 +2700,15 @@ internal sealed class NativeDependencyClosure
 
         private NativePathBinding ProtectConfiguration(string path)
         {
+            diagnostic?.Inspect("ProtectConfiguration", path);
             NativePathBinding proof = BindPath(path, false, true);
             if (proof.Exists && !_objects.ContainsKey(proof.CanonicalPath))
             {
-                using FileStream stream = OpenBound(proof);
+                using FileStream stream = OpenBound(proof, diagnostic);
                 NativeElfImage? native = NativeElfReader.ReadModuleMetadata(stream);
                 NativeElfImageBinding? image = native is null ? null : CopyImage(native);
                 string hash = HashFile(stream);
-                RequireUnchanged(stream, proof.Identity);
+                RequireUnchanged(stream, proof.Identity, diagnostic);
                 if (_objects.Count >= MaximumObjects)
                 {
                     throw NativeElfReader.Failure();
@@ -2348,13 +2734,15 @@ internal sealed class NativeDependencyClosure
             return proof;
         }
 
-        internal static string[] ReadConfigurationLines(NativePathBinding proof)
+        internal static string[] ReadConfigurationLines(NativePathBinding proof, PreparationDiagnostic? diagnostic = null)
         {
+            diagnostic?.Inspect("ReadConfigurationLines", proof.AliasPath, proof.CanonicalPath);
             if (proof.Identity.Size > MaximumConfigurationBytes)
             {
                 throw NativeElfReader.Failure();
             }
-            using FileStream stream = OpenBound(proof);
+            using FileStream stream = OpenBound(proof, diagnostic);
+            diagnostic?.Inspect("ReadConfigurationLines", proof.AliasPath, proof.CanonicalPath);
             using var reader = new StreamReader(stream, StrictUtf8, detectEncodingFromByteOrderMarks: false, bufferSize: 4096, leaveOpen: true);
             var result = new List<string>();
             int characters = 0;
@@ -2368,12 +2756,13 @@ internal sealed class NativeDependencyClosure
                 }
                 result.Add(line);
             }
-            RequireUnchanged(stream, proof.Identity);
+            RequireUnchanged(stream, proof.Identity, diagnostic);
             return result.ToArray();
         }
 
         private string[] FreezeConfigurationDirectory(string path, string[]? capturedNames = null)
         {
+            diagnostic?.InspectBound("FreezeConfigurationDirectory", path, _paths, path);
             if (_configurationDirectories.TryGetValue(path, out NativeConfigurationDirectoryBinding? previous))
             {
                 return previous.EntryNames;
@@ -2382,7 +2771,7 @@ internal sealed class NativeDependencyClosure
             {
                 throw NativeElfReader.Failure();
             }
-            string[] names = capturedNames ?? ReadEntryNames(path);
+            string[] names = capturedNames ?? ReadEntryNames(path, diagnostic);
             AccountCharacters(path.Length + 64L);
             foreach (string name in names)
             {
@@ -2401,8 +2790,10 @@ internal sealed class NativeDependencyClosure
 
         private NativePathBinding ProbePath(string path, bool directory, bool freezeMetadata)
         {
+            diagnostic?.Inspect(directory ? "ProbeDirectory" : "ProbeFile", path);
             RequireAbsoluteAlias(path);
-            var proof = WineXeBuildToolchainResolver.GetProtectedNativeOptionalPath(path, directory);
+            var proof = WineXeBuildToolchainResolver.GetProtectedNativeOptionalPath(path, directory, diagnostic?.OriginObserver);
+            diagnostic?.Inspect(directory ? "ProbeDirectory" : "ProbeFile", path, proof.CanonicalPath);
             return new NativePathBinding(path, directory, proof.Identity.HasValue, proof.CanonicalPath,
                 proof.Identity.GetValueOrDefault(), proof.ExistingAncestor, proof.AncestorIdentity, freezeMetadata);
         }
@@ -2457,16 +2848,17 @@ internal sealed class NativeDependencyClosure
             }
         }
 
-        private static FileStream OpenBound(NativePathBinding proof)
+        private static FileStream OpenBound(NativePathBinding proof, PreparationDiagnostic? diagnostic = null)
         {
+            diagnostic?.Inspect("OpenBound", proof.AliasPath, proof.CanonicalPath);
             if (!proof.Exists)
             {
                 throw NativeElfReader.Failure();
             }
-            FileStream stream = WineXeBuildToolchainResolver.OpenProtectedRead(proof.AliasPath);
+            FileStream stream = WineXeBuildToolchainResolver.OpenProtectedRead(proof.AliasPath, diagnostic?.OriginObserver);
             try
             {
-                RequireUnchanged(stream, proof.Identity);
+                RequireUnchanged(stream, proof.Identity, diagnostic);
                 return stream;
             }
             catch
@@ -2476,9 +2868,9 @@ internal sealed class NativeDependencyClosure
             }
         }
 
-        private static void RequireUnchanged(FileStream stream, NativeFileIdentity identity)
+        private static void RequireUnchanged(FileStream stream, NativeFileIdentity identity, PreparationDiagnostic? diagnostic = null)
         {
-            if (WineXeBuildToolchainResolver.GetNativeIdentity(stream.SafeFileHandle) != identity)
+            if (WineXeBuildToolchainResolver.GetNativeIdentity(stream.SafeFileHandle, diagnostic?.OriginObserver) != identity)
             {
                 throw NativeElfReader.Failure();
             }

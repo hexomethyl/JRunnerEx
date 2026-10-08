@@ -32,6 +32,8 @@ jobs:
         run: dotnet build JRunner.Native.sln -c Release --no-restore
 
       - name: Test native solution
+        env:
+          JRUNNER_NATIVE_CLOSURE_DIAGNOSTIC: '1'
         run: dotnet test JRunner.Native.sln -c Release --no-build
 
       - name: Publish Linux CLI

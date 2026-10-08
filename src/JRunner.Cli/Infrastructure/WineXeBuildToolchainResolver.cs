@@ -146,7 +146,8 @@ internal sealed class WineXeBuildToolchainResolver
         }
     }
 
-    internal static FileStream OpenProtectedRead(string absolutePath)
+    internal static FileStream OpenProtectedRead(
+        string absolutePath, Action<Exception>? diagnosticObserver = null)
     {
         SafeFileHandle? readable = null;
         try
@@ -154,7 +155,7 @@ internal sealed class WineXeBuildToolchainResolver
             RequireAbsoluteProtectedPath(absolutePath);
             using SafeFileHandle bound = OpenProtectedAlias(
                 absolutePath, GetEffectiveUserId(), forWinePath: false, ProtectedPathKind.File);
-            NativeFileIdentity expected = GetNativeIdentity(bound);
+            NativeFileIdentity expected = GetNativeIdentity(bound, diagnosticObserver);
             // Reopen only the already-admitted descriptor. No pathname lookup can substitute a file.
             int descriptor = OpenNative(DescriptorPath(bound), LinuxCloseOnExec, mode: 0);
             if (descriptor < 0)
@@ -162,7 +163,7 @@ internal sealed class WineXeBuildToolchainResolver
                 throw NativeElfReader.Failure();
             }
             readable = new SafeFileHandle((IntPtr)descriptor, ownsHandle: true);
-            if (GetNativeIdentity(readable) != expected ||
+            if (GetNativeIdentity(readable, diagnosticObserver) != expected ||
                 (expected.Mode & LinuxFileTypeMask) != LinuxRegularFile)
             {
                 throw NativeElfReader.Failure();
@@ -173,6 +174,7 @@ internal sealed class WineXeBuildToolchainResolver
         }
         catch (Exception exception) when (IsTrustValidationFailure(exception) || exception is OperationFailureException)
         {
+            ObserveDiagnosticFailure(diagnosticObserver, exception);
             throw NativeElfReader.Failure();
         }
         finally
@@ -181,7 +183,8 @@ internal sealed class WineXeBuildToolchainResolver
         }
     }
 
-    internal static NativeFileIdentity GetProtectedNativeIdentity(string absolutePath, bool directory)
+    internal static NativeFileIdentity GetProtectedNativeIdentity(
+        string absolutePath, bool directory, Action<Exception>? diagnosticObserver = null)
     {
         try
         {
@@ -189,15 +192,17 @@ internal sealed class WineXeBuildToolchainResolver
             using SafeFileHandle handle = OpenProtectedAlias(
                 absolutePath, GetEffectiveUserId(), forWinePath: false,
                 directory ? ProtectedPathKind.Directory : ProtectedPathKind.File);
-            return GetNativeIdentity(handle);
+            return GetNativeIdentity(handle, diagnosticObserver);
         }
         catch (Exception exception) when (IsTrustValidationFailure(exception) || exception is OperationFailureException)
         {
+            ObserveDiagnosticFailure(diagnosticObserver, exception);
             throw NativeElfReader.Failure();
         }
     }
 
-    internal static NativeFileIdentity GetNativeIdentity(SafeFileHandle handle)
+    internal static NativeFileIdentity GetNativeIdentity(
+        SafeFileHandle handle, Action<Exception>? diagnosticObserver = null)
     {
         try
         {
@@ -214,11 +219,13 @@ internal sealed class WineXeBuildToolchainResolver
         }
         catch (Exception exception) when (IsTrustValidationFailure(exception))
         {
+            ObserveDiagnosticFailure(diagnosticObserver, exception);
             throw NativeElfReader.Failure();
         }
     }
 
-    internal static string GetProtectedCanonicalPath(string absolutePath, bool directory)
+    internal static string GetProtectedCanonicalPath(
+        string absolutePath, bool directory, Action<Exception>? diagnosticObserver = null)
     {
         try
         {
@@ -230,12 +237,14 @@ internal sealed class WineXeBuildToolchainResolver
         }
         catch (Exception exception) when (IsTrustValidationFailure(exception) || exception is OperationFailureException)
         {
+            ObserveDiagnosticFailure(diagnosticObserver, exception);
             throw NativeElfReader.Failure();
         }
     }
 
     internal static (string CanonicalPath, NativeFileIdentity? Identity, string ExistingAncestor,
-        NativeFileIdentity AncestorIdentity) GetProtectedNativeOptionalPath(string absolutePath, bool directory)
+        NativeFileIdentity AncestorIdentity) GetProtectedNativeOptionalPath(
+        string absolutePath, bool directory, Action<Exception>? diagnosticObserver = null)
     {
         try
         {
@@ -249,13 +258,15 @@ internal sealed class WineXeBuildToolchainResolver
                 return missing ?? throw NativeElfReader.Failure();
             }
             string canonical = GetDescriptorCanonicalPath(handle);
-            NativeFileIdentity identity = GetNativeIdentity(handle);
+            NativeFileIdentity identity = GetNativeIdentity(handle, diagnosticObserver);
             string ancestor = directory ? canonical : Path.GetDirectoryName(canonical)!;
-            NativeFileIdentity ancestorIdentity = directory ? identity : GetProtectedNativeIdentity(ancestor, directory: true);
+            NativeFileIdentity ancestorIdentity = directory ? identity : GetProtectedNativeIdentity(
+                ancestor, directory: true, diagnosticObserver: diagnosticObserver);
             return (canonical, identity, ancestor, ancestorIdentity);
         }
         catch (Exception exception) when (IsTrustValidationFailure(exception) || exception is OperationFailureException)
         {
+            ObserveDiagnosticFailure(diagnosticObserver, exception);
             throw NativeElfReader.Failure();
         }
     }
@@ -1879,6 +1890,18 @@ internal sealed class WineXeBuildToolchainResolver
     {
         return IsNativeSupportFailure(exception) ||
             exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException or System.Security.SecurityException;
+    }
+
+    private static void ObserveDiagnosticFailure(Action<Exception>? diagnosticObserver, Exception exception)
+    {
+        try
+        {
+            diagnosticObserver?.Invoke(exception);
+        }
+        catch
+        {
+            // Diagnostics must not alter the existing normalized failure.
+        }
     }
 
     private static OperationFailureException Unavailable(bool forWinePath)
