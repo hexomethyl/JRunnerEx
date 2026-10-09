@@ -12,7 +12,26 @@ is rejected before any flash, SMC, or eMMC operation is sent.
 
 ## Native build and fixtures
 
-From this repository root, with SDK `10.0.401` from `global.json` installed:
+`global.json` pins .NET SDK `10.0.401` exactly (`rollForward: disable`) so local
+builds match CI and the committed `packages.lock.json` files. Ubuntu's apt
+packages provide only `10.0.1xx` SDKs, so install the pinned SDK per user with
+Microsoft's install script, run from this repository root:
+
+```sh
+curl -fsSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin --jsonfile global.json --install-dir "$HOME/.dotnet"
+```
+
+Put that install ahead of the distro `dotnet` by adding these lines to your shell
+startup file (for example `~/.bashrc`), then open a new shell; `dotnet --version`
+must print `10.0.401`. `DOTNET_ROOT` also makes the framework-dependent `jrunner`
+apphost run on that install's .NET 10 runtime.
+
+```sh
+export DOTNET_ROOT="$HOME/.dotnet"
+export PATH="$DOTNET_ROOT:$PATH"
+```
+
+Then, from this repository root:
 
 ```sh
 dotnet restore JRunner.Native.sln --locked-mode
@@ -52,6 +71,18 @@ CLI:
 ./artifacts/linux-x64/jrunner patch inspect --input tests/fixtures/patches/patches.bin --json
 ```
 
+Select the inspection input with `jrunner nand inspect --input <file>`; it is
+not an unnamed operand before or after the command. `nand compare` instead
+accepts two positional files. Root, group, and leaf help describe the registered
+commands, options, safety notes, and examples without running the operation:
+
+```sh
+./artifacts/linux-x64/jrunner --help
+./artifacts/linux-x64/jrunner nand --help
+./artifacts/linux-x64/jrunner nand inspect --help
+./artifacts/linux-x64/jrunner pico nand-write --help --json
+```
+
 These files contain only deterministic synthetic data. Their byte lengths and
 SHA-256 digests are locked in `tests/fixtures/manifest.v1.json`. Generate a
 fresh fixture tree when that contract changes:
@@ -73,6 +104,16 @@ With `--json`, stdout contains exactly one compact UTF-8 object with
 and `error` containing numeric `code`, stable `kind`, and human `message`.
 A completed unequal `nand compare` is still a success envelope with
 `result.equal: false`, but exits `1`.
+
+Invocation errors identify registered options or operands and show canonical
+usage, an example, and the appropriate `--help` command. Supplied values,
+paths, environment-variable names, and unknown option spellings are deliberately
+redacted, even if they seem harmless. Ordinary input-open errors identify the
+input's label (`--input`, `<left>`, `<right>`, `--ecc`, or `--flash`) and explain
+missing files, directory inputs, or denied access without exposing the supplied
+path or exception details. In JSON mode the complete safe `error.message` is
+also written to stderr; consumers should rely on the stable code and kind,
+not exact diagnostic prose.
 
 | Exit | Meaning |
 | --- | --- |

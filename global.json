@@ -1,6 +1,7 @@
 {
   "sdk": {
     "version": "10.0.401",
-    "rollForward": "disable"
+    "rollForward": "disable",
+    "errorMessage": "JRunnerEx requires .NET SDK 10.0.401 exactly (pinned in global.json). Ubuntu apt packages only provide 10.0.1xx SDKs.\nFrom the repository root install it with:\n  curl -fsSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin --jsonfile global.json --install-dir \"$HOME/.dotnet\"\nThen add these lines to your shell startup file (for example ~/.bashrc) and open a new shell:\n  export DOTNET_ROOT=\"$HOME/.dotnet\"\n  export PATH=\"$DOTNET_ROOT:$PATH\"\nSee README.md (Native build and fixtures)."
   }
 }

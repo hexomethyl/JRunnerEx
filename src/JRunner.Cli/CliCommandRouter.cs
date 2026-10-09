@@ -23,22 +23,9 @@ namespace JRunner.Cli;
 /// <summary>
 /// Parses and executes the native NAND, patch, console, device, Pico, support, and XeBuild command surface.
 /// </summary>
-internal static class CliCommandRouter
+internal static partial class CliCommandRouter
 {
     private const int FileBufferSize = 0x10000;
-    private const string CpuKeySourceHelp = "--cpu-key-file <file>|--cpu-key-env <name>|--cpu-key-stdin";
-    private const string PicoCommandList =
-        "  pico probe\n" +
-        "  pico smc-stop\n" +
-        "  pico smc-start\n" +
-        "  pico reboot-bootloader\n" +
-        "  pico nand-read\n" +
-        "  pico nand-write\n" +
-        "  pico nand-erase\n" +
-        "  pico emmc-probe\n" +
-        "  pico emmc-read\n";
-    private const string PicoConnectionHelp =
-        "\nSelectors are mutually exclusive. Timeout is a positive no-progress deadline in seconds (default: 10).\n";
     private static readonly Lazy<XeBuildSupportIndex> PinnedXeBuildSupportIndex = new(
         static () => XeBuildSupportIndex.FromManifest(EmbeddedSupportManifest.Current),
         LazyThreadSafetyMode.ExecutionAndPublication);
@@ -69,7 +56,7 @@ internal static class CliCommandRouter
                     jsonRequested,
                     standardOutput,
                     standardError,
-                    CreateParseFailure(commands, parseResult));
+                    CreateParseFailure(commands, parseResult, informationRequested: true));
             }
 
             return RenderInformationAsync(
@@ -89,7 +76,7 @@ internal static class CliCommandRouter
                     jsonRequested,
                     standardOutput,
                     standardError,
-                    CreateParseFailure(commands, parseResult));
+                    CreateParseFailure(commands, parseResult, informationRequested: true));
             }
 
             return RenderInformationAsync(
@@ -302,7 +289,7 @@ internal static class CliCommandRouter
             jsonRequested,
             standardOutput,
             standardError,
-            UnsupportedCommand());
+            UnsupportedCommand(commands, selectedCommand));
     }
 
     private static Task<int> RunNandInspectAsync(
@@ -332,7 +319,7 @@ internal static class CliCommandRouter
                             token)
                         .ConfigureAwait(false);
 
-                    await using FileStream input = OpenRead(inputPath);
+                    await using FileStream input = OpenRead(inputPath, "--input");
                     NandInspectionResult result = await NandImageService.InspectAsync(
                             input,
                             cpuKey,
@@ -372,8 +359,8 @@ internal static class CliCommandRouter
                         "right-input-required",
                         "A right NAND input file is required.");
 
-                    await using FileStream left = OpenRead(leftPath);
-                    await using FileStream right = OpenRead(rightPath);
+                    await using FileStream left = OpenRead(leftPath, "<left>");
+                    await using FileStream right = OpenRead(rightPath, "<right>");
                     NandCanonicalComparisonResult result = await NandCanonicalComparisonService.CompareAsync(
                             new NandCanonicalComparisonRequest(
                                 new NandCanonicalInput(left),
@@ -437,8 +424,8 @@ internal static class CliCommandRouter
                         flashPath,
                         parseResult.GetValue(commands.NandRgh3ConvertCpuKey.File));
                     await using var output = AtomicOutputFile.Create(outputPath, force);
-                    await using FileStream ecc = OpenRead(eccPath);
-                    await using FileStream flash = OpenRead(flashPath);
+                    await using FileStream ecc = OpenRead(eccPath, "--ecc");
+                    await using FileStream flash = OpenRead(flashPath, "--flash");
                     Rgh2ToRgh3ConversionResult result = await Rgh2ToRgh3ConversionService.ConvertAsync(
                             new Rgh2ToRgh3ConversionRequest(ecc, flash, output.Stream, cpuKey, patchSmc),
                             progress,
@@ -1012,7 +999,7 @@ internal static class CliCommandRouter
                         commands.PicoNandWriteInput,
                         "pico-nand-input-required",
                         "A NAND input file is required.");
-                    await using FileStream input = OpenRead(inputPath);
+                    await using FileStream input = OpenRead(inputPath, "--input");
                     await using PicoFlasherConnection connection = await OpenPicoConnectionAsync(
                             picoConnectionFactory,
                             selector,
@@ -1123,13 +1110,16 @@ internal static class CliCommandRouter
             cancellationToken);
     }
 
-    private static OperationFailure CreateParseFailure(CommandDefinitions commands, ParseResult parseResult)
+    private static OperationFailure CreateParseFailure(
+        CommandDefinitions commands,
+        ParseResult parseResult,
+        bool informationRequested = false)
     {
         Command selectedCommand = parseResult.CommandResult.Command;
 
         if (HasUnsupportedPicoPath(commands, parseResult))
         {
-            return UnsupportedCommand();
+            return UnsupportedCommand(commands, commands.Pico);
         }
 
         if ((ReferenceEquals(selectedCommand, commands.Root) ||
@@ -1142,13 +1132,117 @@ internal static class CliCommandRouter
              ReferenceEquals(selectedCommand, commands.XeBuild)) &&
             !parseResult.Errors.Any(static error => error.SymbolResult is OptionResult or ArgumentResult))
         {
-            return UnsupportedCommand();
+            return UnsupportedCommand(commands, selectedCommand);
+        }
+
+        int unmatchedCount = parseResult.UnmatchedTokens.Count;
+        var diagnostics = new List<string>();
+        var failingSymbols = new HashSet<Symbol>();
+        foreach (ParseError error in parseResult.Errors)
+        {
+            if (informationRequested && IsIgnorableInformationError(error, parseResult))
+            {
+                continue;
+            }
+
+            // Public symbol identities supply registered names without consulting raw parser text.
+            switch (error.SymbolResult)
+            {
+                case OptionResult optionResult when failingSymbols.Add(optionResult.Option):
+                    diagnostics.Add(GetOptionParseDiagnostic(commands, optionResult));
+                    break;
+                case ArgumentResult argumentResult when failingSymbols.Add(argumentResult.Argument):
+                    diagnostics.Add(GetArgumentParseDiagnostic(argumentResult));
+                    break;
+            }
+        }
+
+        if (unmatchedCount != 0)
+        {
+            diagnostics.Add(
+                $"Unexpected or unrecognized arguments: {unmatchedCount}. Use only the options and operands shown in the usage.");
+        }
+
+        if (diagnostics.Count == 0)
+        {
+            diagnostics.Add("The command arguments do not match this command's usage.");
         }
 
         return new OperationFailure(
             ExitCode.Usage,
             "invalid-command-arguments",
-            "The command arguments are invalid.");
+            AppendUsageGuidance(commands, selectedCommand, string.Join("\n", diagnostics)));
+    }
+
+    private static string GetOptionParseDiagnostic(CommandDefinitions commands, OptionResult optionResult)
+    {
+        Option option = optionResult.Option;
+        int valueCount = optionResult.Tokens.Count;
+        if (option.Required &&
+            optionResult.Implicit &&
+            optionResult.IdentifierToken is null &&
+            valueCount == 0)
+        {
+            return $"Missing required option '{option.Name}'.";
+        }
+
+        if (optionResult.IdentifierTokenCount > 0 && valueCount < option.Arity.MinimumNumberOfValues)
+        {
+            return $"Option '{option.Name}' requires a value <{option.HelpName ?? "value"}>.";
+        }
+
+        if (option.Arity.MaximumNumberOfValues == 1 &&
+            (valueCount > 1 || optionResult.IdentifierTokenCount > 1))
+        {
+            return $"Option '{option.Name}' accepts one value; specify it once.";
+        }
+
+        if (ReferenceEquals(option, commands.XeBuildBuildPatches) &&
+            optionResult.IdentifierTokenCount != valueCount)
+        {
+            return "Each --patch option requires exactly one patch name; repeat --patch for multiple names.";
+        }
+
+        if (ReferenceEquals(option, commands.SupportRoot))
+        {
+            return "Option '--support-root' requires a valid non-root directory path.";
+        }
+
+        Type valueType = Nullable.GetUnderlyingType(option.ValueType) ?? option.ValueType;
+        if (valueType == typeof(uint))
+        {
+            return $"Option '{option.Name}' requires a whole number from 0 to 4294967295.";
+        }
+
+        if (valueType == typeof(int))
+        {
+            return $"Option '{option.Name}' requires a whole number from -2147483648 to 2147483647.";
+        }
+
+        if (valueType == typeof(double))
+        {
+            return $"Option '{option.Name}' requires a number.";
+        }
+
+        return $"The value supplied for option '{option.Name}' is invalid. See its help for accepted values.";
+    }
+
+    private static string GetArgumentParseDiagnostic(ArgumentResult argumentResult)
+    {
+        string name = argumentResult.Argument.Name;
+        return argumentResult.Tokens.Count < argumentResult.Argument.Arity.MinimumNumberOfValues
+            ? $"Missing required argument '<{name}>'."
+            : $"The value supplied for argument '<{name}>' is invalid.";
+    }
+
+    private static string AppendUsageGuidance(
+        CommandDefinitions commands,
+        Command selectedCommand,
+        string message)
+    {
+        return $"{message}\n\n{GetUsageText(commands, selectedCommand)}\n" +
+            $"Example: {GetExampleCommand(commands, selectedCommand)}\n" +
+            $"Run '{GetCommandPath(commands, selectedCommand)} --help' for details.";
     }
 
     private static bool HasUnsupportedPicoPath(CommandDefinitions commands, ParseResult parseResult)
@@ -1213,12 +1307,18 @@ internal static class CliCommandRouter
         }
     }
 
-    private static OperationFailure UnsupportedCommand()
+    private static OperationFailure UnsupportedCommand(CommandDefinitions commands, Command selectedCommand)
     {
+        string message = ReferenceEquals(selectedCommand, commands.Root)
+            ? "Choose a supported command.\nAvailable command groups: " +
+                string.Join(", ", commands.Root.Subcommands.Select(static command => command.Name)) + "."
+            : $"Choose a supported subcommand for '{GetCommandPath(commands, selectedCommand)}'.\n" +
+                "Available subcommands: " +
+                string.Join(", ", selectedCommand.Subcommands.Select(static command => command.Name)) + ".";
         return new OperationFailure(
             ExitCode.Usage,
             "unsupported-command",
-            "Unsupported command. Use a supported nand, patch, console, device, pico, support, or xebuild subcommand.");
+            AppendUsageGuidance(commands, selectedCommand, message));
     }
 
     private static bool HasInvalidHelpArguments(ParseResult parseResult)
@@ -1228,36 +1328,31 @@ internal static class CliCommandRouter
             return true;
         }
 
-        foreach (ParseError error in parseResult.Errors)
+        return parseResult.Errors.Any(error => !IsIgnorableInformationError(error, parseResult));
+    }
+
+    private static bool IsIgnorableInformationError(ParseError error, ParseResult parseResult)
+    {
+        // Information requests may omit required operands, but not malformed supplied values.
+        if (error.SymbolResult is OptionResult optionResult &&
+            optionResult.Option.Required &&
+            optionResult.Implicit &&
+            optionResult.IdentifierToken is null &&
+            optionResult.Tokens.Count == 0)
         {
-            // Help may omit required operands, but must not hide malformed supplied values.
-            if (error.SymbolResult is OptionResult optionResult &&
-                optionResult.Option.Required &&
-                optionResult.Implicit &&
-                optionResult.IdentifierToken is null &&
-                optionResult.Tokens.Count == 0)
-            {
-                continue;
-            }
-
-            if (error.SymbolResult is ArgumentResult argumentResult &&
-                argumentResult.Tokens.Count == 0 &&
-                argumentResult.Argument.Arity.MinimumNumberOfValues > 0)
-            {
-                continue;
-            }
-
-            // A bare command group has no action; asking for its help need not name a child.
-            if (ReferenceEquals(error.SymbolResult, parseResult.CommandResult) &&
-                parseResult.CommandResult.Command.Subcommands.Count > 0)
-            {
-                continue;
-            }
-
             return true;
         }
 
-        return false;
+        if (error.SymbolResult is ArgumentResult argumentResult &&
+            argumentResult.Tokens.Count == 0 &&
+            argumentResult.Argument.Arity.MinimumNumberOfValues > 0)
+        {
+            return true;
+        }
+
+        // A bare command group has no action; an information request need not name a child.
+        return ReferenceEquals(error.SymbolResult, parseResult.CommandResult) &&
+            parseResult.CommandResult.Command.Subcommands.Count > 0;
     }
 
     private static void ValidateHelpOptions(CommandDefinitions commands, ParseResult parseResult)
@@ -1382,132 +1477,6 @@ internal static class CliCommandRouter
         return false;
     }
 
-    private static string GetHelpText(CommandDefinitions commands, Command selectedCommand)
-    {
-        if (ReferenceEquals(selectedCommand, commands.NandInspect))
-        {
-            return $"Usage: jrunner nand inspect --input <file> [{CpuKeySourceHelp}] [--json]\n";
-        }
-
-        if (ReferenceEquals(selectedCommand, commands.NandCompare))
-        {
-            return "Usage: jrunner nand compare <left> <right> [--json]\n";
-        }
-
-        if (ReferenceEquals(selectedCommand, commands.NandRgh3Convert))
-        {
-            return $"Usage: jrunner nand rgh3-convert --ecc <file> --flash <file> ({CpuKeySourceHelp}) --output <file> [--no-smc-patch] [--force] [--json]\n";
-        }
-
-        if (ReferenceEquals(selectedCommand, commands.PatchInspect))
-        {
-            return "Usage: jrunner patch inspect --input <file> [--json]\n";
-        }
-
-        if (ReferenceEquals(selectedCommand, commands.ConsoleList))
-        {
-            return "Usage: jrunner console list [--json]\n";
-        }
-
-        if (ReferenceEquals(selectedCommand, commands.Device) ||
-            ReferenceEquals(selectedCommand, commands.DeviceList))
-        {
-            return "Usage: jrunner device list [--json]\n\nLists command interfaces without opening a transport or sending GET_VERSION.\n";
-        }
-
-        if (ReferenceEquals(selectedCommand, commands.Pico))
-        {
-            return "Usage: jrunner pico <command> [options]\n\nCommands:\n" + PicoCommandList;
-        }
-
-        if (ReferenceEquals(selectedCommand, commands.PicoProbe))
-        {
-            return "Usage: jrunner pico probe [--device <path>|--serial <value>] [--timeout <seconds>] [--json]\n" + PicoConnectionHelp;
-        }
-
-        if (ReferenceEquals(selectedCommand, commands.PicoSmcStop))
-        {
-            return "Usage: jrunner pico smc-stop [--device <path>|--serial <value>] [--timeout <seconds>] [--json]\n" +
-                "\nStops the SMC and intentionally leaves it stopped.\n" + PicoConnectionHelp;
-        }
-
-        if (ReferenceEquals(selectedCommand, commands.PicoSmcStart))
-        {
-            return "Usage: jrunner pico smc-start [--device <path>|--serial <value>] [--timeout <seconds>] [--json]\n" + PicoConnectionHelp;
-        }
-
-        if (ReferenceEquals(selectedCommand, commands.PicoRebootBootloader))
-        {
-            return "Usage: jrunner pico reboot-bootloader [--device <path>|--serial <value>] [--timeout <seconds>] [--json]\n" + PicoConnectionHelp;
-        }
-
-        if (ReferenceEquals(selectedCommand, commands.PicoEmmcProbe))
-        {
-            return "Usage: jrunner pico emmc-probe [--device <path>|--serial <value>] [--timeout <seconds>] [--json]\n" + PicoConnectionHelp;
-        }
-
-        if (ReferenceEquals(selectedCommand, commands.PicoEmmcRead))
-        {
-            return "Usage: jrunner pico emmc-read [--device <path>|--serial <value>] [--start-block <record>] --blocks <count> --output <file> [--timeout <seconds>] [--force] [--json]\n" +
-                "\nBlocks are 512-byte logical-data records within the 48 MiB system partition.\n" + PicoConnectionHelp;
-        }
-
-        if (ReferenceEquals(selectedCommand, commands.PicoNandRead))
-        {
-            return "Usage: jrunner pico nand-read [--device <path>|--serial <value>] [--start-block <record>] [--blocks <count>] --output <file> [--timeout <seconds>] [--force] [--json]\n" +
-                "\nBlocks are 512-byte logical-data records; raw output includes each record's 16 spare bytes.\n" + PicoConnectionHelp;
-        }
-
-        if (ReferenceEquals(selectedCommand, commands.PicoNandWrite))
-        {
-            return "Usage: jrunner pico nand-write [--device <path>|--serial <value>] --start-block <record> --input <file> --yes [--timeout <seconds>] [--json]\n" +
-                "\nThe start block must be erase-unit aligned; nonempty input must contain complete 528-byte raw records and complete erase units.\n" +
-                "Firmware WRITE_FLASH automatically erases each erase-unit boundary; no separate erase is performed.\n" + PicoConnectionHelp;
-        }
-
-        if (ReferenceEquals(selectedCommand, commands.PicoNandErase))
-        {
-            return "Usage: jrunner pico nand-erase [--device <path>|--serial <value>] --start-erase-block <index> --erase-blocks <count> --yes [--timeout <seconds>] [--json]\n" +
-                "\nErase-block indices address complete erase units, not individual logical records.\n" + PicoConnectionHelp;
-        }
-
-        if (ReferenceEquals(selectedCommand, commands.XeBuildBuild))
-        {
-            return
-                $"Usage: jrunner xebuild build --input <nand> ({CpuKeySourceHelp}) --dashboard <number> --type <canonical> --output <file> " +
-                "[--console <canonical-name>] [--patch <name> ...] [--bigffs] [--rgh3] [--dashlaunch] [--drive-patch usb|hdd|both] " +
-                "[--system-partition-only|--full-4gb-data] [--backend wine|native] [--keep-workspace] " +
-                "[--force] [--support-root <path>] [--json]\n";
-        }
-
-        if (ReferenceEquals(selectedCommand, commands.SupportStatus))
-        {
-            return "Usage: jrunner support status [--support-root <path>] [--json]\n";
-        }
-
-        if (ReferenceEquals(selectedCommand, commands.SupportInstall))
-        {
-            return "Usage: jrunner support install [--archive <local-file>] [--support-root <path>] [--json]\n";
-        }
-
-        return
-            "Usage: jrunner [--support-root <path>] <command> [options]\n" +
-            "\n" +
-            "Commands:\n" +
-            "  nand inspect\n" +
-            "  nand compare\n" +
-            "  nand rgh3-convert\n" +
-            "  patch inspect\n" +
-            "  console list\n" +
-            "  device list\n" +
-            PicoCommandList +
-            "  support status\n" +
-            "  support install\n" +
-            "  xebuild build\n" +
-            "\nGlobal options:\n" +
-            "  --support-root <path>  Override support resolution for support and XeBuild commands.\n" +
-            "  --json                 Write one structured result object to stdout.\n";
-    }
 
 
     private static SupportRoot ResolveSupportRoot(ParseResult parseResult, Option<string> supportRootOption)
@@ -1775,23 +1744,55 @@ internal static class CliCommandRouter
     }
 
 
-    private static FileStream OpenRead(string path, int bufferSize = FileBufferSize)
+    private static FileStream OpenRead(string path, string operand, int bufferSize = FileBufferSize)
     {
-        return new FileStream(
-            NormalizeInputPath(path),
-            new FileStreamOptions
-            {
-                Access = FileAccess.Read,
-                Mode = FileMode.Open,
-                Share = FileShare.Read,
-                BufferSize = bufferSize,
-                Options = FileOptions.Asynchronous,
-            });
+        string normalizedPath = NormalizeInputPath(path);
+        try
+        {
+            return new FileStream(
+                normalizedPath,
+                new FileStreamOptions
+                {
+                    Access = FileAccess.Read,
+                    Mode = FileMode.Open,
+                    Share = FileShare.Read,
+                    BufferSize = bufferSize,
+                    Options = FileOptions.Asynchronous,
+                });
+        }
+        catch (IOException exception) when (exception is FileNotFoundException or DirectoryNotFoundException)
+        {
+            throw new OperationFailureException(
+                ExitCode.InputOutput,
+                "io-error",
+                $"Cannot open the file for {operand}: the file or its parent directory does not exist. Check the path supplied to {operand}.");
+        }
+        catch (UnauthorizedAccessException) when (Directory.Exists(normalizedPath))
+        {
+            throw new OperationFailureException(
+                ExitCode.DeviceUnavailable,
+                "permission-denied",
+                $"Cannot open the file for {operand}: the supplied path names a directory. Select a file.");
+        }
+        catch (UnauthorizedAccessException)
+        {
+            throw new OperationFailureException(
+                ExitCode.DeviceUnavailable,
+                "permission-denied",
+                $"Cannot read the file for {operand}: access was denied. Check file and parent-directory permissions.");
+        }
+        catch (IOException)
+        {
+            throw new OperationFailureException(
+                ExitCode.InputOutput,
+                "io-error",
+                $"Cannot open the file for {operand} because of an I/O error. Check that the file is available and readable.");
+        }
     }
 
     private static async Task<byte[]> ReadPatchBytesAsync(string path, CancellationToken cancellationToken)
     {
-        await using FileStream input = OpenRead(path);
+        await using FileStream input = OpenRead(path, "--input");
         if (input.Length > int.MaxValue)
         {
             throw new OperationFailureException(
@@ -1936,11 +1937,13 @@ internal static class CliCommandRouter
             File = new Option<string>("--cpu-key-file")
             {
                 Description = "A file containing one CPU key; mutually exclusive with the environment and stdin sources.",
+                HelpName = "file",
                 Arity = ArgumentArity.ExactlyOne,
             };
             Environment = new Option<string>("--cpu-key-env")
             {
                 Description = "The name of an environment variable containing one CPU key.",
+                HelpName = "name",
                 Arity = ArgumentArity.ExactlyOne,
             };
             StandardInput = new Option<bool>("--cpu-key-stdin")
@@ -1967,14 +1970,17 @@ internal static class CliCommandRouter
             Device = new Option<string>("--device")
             {
                 Description = "The exact device path of a PicoFlasher command interface; mutually exclusive with --serial.",
+                HelpName = "path",
             };
             Serial = new Option<string>("--serial")
             {
                 Description = "The exact USB serial number of one physical device; mutually exclusive with --device.",
+                HelpName = "value",
             };
             Timeout = new Option<double?>("--timeout")
             {
                 Description = "The positive no-progress timeout in seconds. Defaults to 10 seconds.",
+                HelpName = "seconds",
             };
             command.Options.Add(Device);
             command.Options.Add(Serial);
@@ -2003,7 +2009,7 @@ internal static class CliCommandRouter
 
             Nand = new Command("nand", "Inspect, compare, and convert NAND images.");
             NandInspect = new Command("inspect", "Inspect a NAND image.");
-            NandInspectInput = RequiredStringOption("--input", "The NAND image to inspect.");
+            NandInspectInput = RequiredStringOption("--input", "The NAND image to inspect.", "file");
             NandInspectCpuKey = new CpuKeyCommandOptions(NandInspect);
             NandInspect.Options.Add(NandInspectInput);
 
@@ -2020,10 +2026,10 @@ internal static class CliCommandRouter
             NandCompare.Arguments.Add(NandCompareRight);
 
             NandRgh3Convert = new Command("rgh3-convert", "Convert an RGH2 NAND image to RGH3.");
-            NandRgh3ConvertEcc = RequiredStringOption("--ecc", "The RGH3 ECC template.");
-            NandRgh3ConvertFlash = RequiredStringOption("--flash", "The RGH2 NAND image.");
+            NandRgh3ConvertEcc = RequiredStringOption("--ecc", "The RGH3 ECC template.", "file");
+            NandRgh3ConvertFlash = RequiredStringOption("--flash", "The RGH2 NAND image.", "file");
             NandRgh3ConvertCpuKey = new CpuKeyCommandOptions(NandRgh3Convert);
-            NandRgh3ConvertOutput = RequiredStringOption("--output", "The converted output image.");
+            NandRgh3ConvertOutput = RequiredStringOption("--output", "The converted output image.", "file");
             NandRgh3ConvertNoSmcPatch = new Option<bool>("--no-smc-patch")
             {
                 Description = "Preserve the source SMC instead of replacing it with the template SMC.",
@@ -2044,7 +2050,7 @@ internal static class CliCommandRouter
 
             Patch = new Command("patch", "Inspect legacy patch sections.");
             PatchInspect = new Command("inspect", "Inspect a patch section.");
-            PatchInspectInput = RequiredStringOption("--input", "The patch section file to inspect.");
+            PatchInspectInput = RequiredStringOption("--input", "The patch section file to inspect.", "file");
             PatchInspect.Options.Add(PatchInspectInput);
             Patch.Subcommands.Add(PatchInspect);
 
@@ -2068,14 +2074,16 @@ internal static class CliCommandRouter
 
             PicoNandRead = new Command("nand-read", "Read raw NAND records to an atomically published file.");
             PicoNandReadOptions = new PicoCommandOptions(PicoNandRead);
-            PicoNandReadOutput = RequiredStringOption("--output", "The raw NAND output file to publish.");
+            PicoNandReadOutput = RequiredStringOption("--output", "The raw NAND output file to publish.", "file");
             PicoNandReadStartBlock = new Option<uint>("--start-block")
             {
                 Description = "The first 512-byte logical-data record to read. Defaults to zero.",
+                HelpName = "record",
             };
             PicoNandReadBlocks = new Option<uint?>("--blocks")
             {
                 Description = "The positive number of 512-byte logical-data records to read. Defaults through the detected NAND end.",
+                HelpName = "count",
             };
             PicoNandReadForce = new Option<bool>("--force")
             {
@@ -2088,10 +2096,11 @@ internal static class CliCommandRouter
 
             PicoNandWrite = new Command("nand-write", "Write raw NAND data; firmware automatically erases at each erase-unit boundary.");
             PicoNandWriteOptions = new PicoCommandOptions(PicoNandWrite);
-            PicoNandWriteInput = RequiredStringOption("--input", "The nonempty raw NAND data-and-spare input, covering complete erase units.");
+            PicoNandWriteInput = RequiredStringOption("--input", "The nonempty raw NAND data-and-spare input, covering complete erase units.", "file");
             PicoNandWriteStartBlock = new Option<uint>("--start-block")
             {
                 Description = "The first 512-byte logical-data record to write, aligned to an erase-unit boundary.",
+                HelpName = "record",
                 Required = true,
             };
             PicoNandWriteYes = new Option<bool>("--yes")
@@ -2107,11 +2116,13 @@ internal static class CliCommandRouter
             PicoNandEraseStartEraseBlock = new Option<uint>("--start-erase-block")
             {
                 Description = "The first NAND erase-block index to erase.",
+                HelpName = "index",
                 Required = true,
             };
             PicoNandEraseEraseBlocks = new Option<uint>("--erase-blocks")
             {
                 Description = "The positive number of complete NAND erase blocks to erase.",
+                HelpName = "count",
                 Required = true,
             };
             PicoNandEraseYes = new Option<bool>("--yes")
@@ -2126,14 +2137,16 @@ internal static class CliCommandRouter
             PicoEmmcProbeOptions = new PicoCommandOptions(PicoEmmcProbe);
             PicoEmmcRead = new Command("emmc-read", "Read raw 512-byte eMMC records to an atomically published file.");
             PicoEmmcReadOptions = new PicoCommandOptions(PicoEmmcRead);
-            PicoEmmcReadOutput = RequiredStringOption("--output", "The raw eMMC output file to publish.");
+            PicoEmmcReadOutput = RequiredStringOption("--output", "The raw eMMC output file to publish.", "file");
             PicoEmmcReadStartBlock = new Option<uint>("--start-block")
             {
                 Description = "The first 512-byte eMMC record to read. Defaults to zero.",
+                HelpName = "record",
             };
             PicoEmmcReadBlocks = new Option<uint>("--blocks")
             {
                 Description = "The positive number of 512-byte eMMC records to read.",
+                HelpName = "count",
                 Required = true,
             };
             PicoEmmcReadForce = new Option<bool>("--force")
@@ -2157,24 +2170,27 @@ internal static class CliCommandRouter
 
             XeBuild = new Command("xebuild", "Build validated XeBuild images with an explicit backend policy.");
             XeBuildBuild = new Command("build", "Build a XeBuild image from an inspected NAND input.");
-            XeBuildBuildInput = RequiredStringOption("--input", "The NAND image to build from.");
+            XeBuildBuildInput = RequiredStringOption("--input", "The NAND image to build from.", "nand");
             XeBuildBuildCpuKey = new CpuKeyCommandOptions(XeBuildBuild);
-            XeBuildBuildOutput = RequiredStringOption("--output", "The output image to publish.");
+            XeBuildBuildOutput = RequiredStringOption("--output", "The output image to publish.", "file");
             XeBuildBuildConsole = new Option<string>("--console")
             {
                 Description = "An optional canonical console name from 'jrunner console list'; otherwise use source inspection.",
+                HelpName = "canonical-name",
                 Arity = ArgumentArity.ExactlyOne,
             };
             XeBuildBuildDashboard = new Option<int>("--dashboard")
             {
                 Description = "The positive dashboard version to build.",
+                HelpName = "number",
                 Required = true,
                 Arity = ArgumentArity.ExactlyOne,
             };
-            XeBuildBuildType = RequiredStringOption("--type", "The canonical XeBuild target name.");
+            XeBuildBuildType = RequiredStringOption("--type", "The canonical XeBuild target name.", "canonical");
             XeBuildBuildPatches = new Option<string[]>("--patch")
             {
                 Description = "A named patch; repeat this option to apply patches in the requested order.",
+                HelpName = "name",
                 Arity = ArgumentArity.OneOrMore,
                 AllowMultipleArgumentsPerToken = false,
             };
@@ -2191,6 +2207,7 @@ internal static class CliCommandRouter
             XeBuildBuildDrivePatch = new Option<string>("--drive-patch")
             {
                 Description = "Apply an XL drive patch: usb, hdd, or both.",
+                HelpName = "usb|hdd|both",
                 Arity = ArgumentArity.ExactlyOne,
             };
             XeBuildBuildSystemPartitionOnly = FlagOption("--system-partition-only", "Stage only the system partition of a full 4 GB source.");
@@ -2198,6 +2215,7 @@ internal static class CliCommandRouter
             XeBuildBuildBackend = new Option<string>("--backend")
             {
                 Description = "Select wine (default) or native (unavailable); never fall back to another backend.",
+                HelpName = "wine|native",
                 Arity = ArgumentArity.ExactlyOne,
             };
             XeBuildBuildKeepWorkspace = FlagOption("--keep-workspace", "Retain only non-secret workspace diagnostics after a failed build.");
@@ -2225,6 +2243,7 @@ internal static class CliCommandRouter
             SupportInstallArchive = new Option<string>("--archive")
             {
                 Description = "Use a local archive matching the pinned support release instead of downloading it.",
+                HelpName = "local-file",
                 Arity = ArgumentArity.ExactlyOne,
             };
             SupportInstall.Options.Add(SupportInstallArchive);
@@ -2400,11 +2419,12 @@ internal static class CliCommandRouter
 
         internal Option<string> SupportInstallArchive { get; }
 
-        private static Option<string> RequiredStringOption(string name, string description)
+        private static Option<string> RequiredStringOption(string name, string description, string helpName)
         {
             return new Option<string>(name)
             {
                 Description = description,
+                HelpName = helpName,
                 Required = true,
                 Arity = ArgumentArity.ExactlyOne,
             };
@@ -2425,6 +2445,7 @@ internal static class CliCommandRouter
             var option = new Option<string>("--support-root")
             {
                 Description = "Override the XeBuild support root (before environment and XDG defaults).",
+                HelpName = "path",
                 Arity = ArgumentArity.ExactlyOne,
                 Recursive = true,
             };

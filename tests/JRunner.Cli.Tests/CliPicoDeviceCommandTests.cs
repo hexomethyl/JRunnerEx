@@ -587,12 +587,12 @@ public sealed class CliPicoDeviceCommandTests
         Assert.Equal(string.Empty, result.Error);
         foreach (string operation in PicoCommands)
         {
-            Assert.Contains($"  pico {operation}\n", result.Output, StringComparison.Ordinal);
+            Assert.Contains($"pico {operation}", result.Output, StringComparison.Ordinal);
         }
 
         if (!picoGroup)
         {
-            Assert.Contains("  device list\n", result.Output, StringComparison.Ordinal);
+            Assert.Contains("device list", result.Output, StringComparison.Ordinal);
         }
 
         Assert.DoesNotContain("pico nand ", result.Output, StringComparison.Ordinal);

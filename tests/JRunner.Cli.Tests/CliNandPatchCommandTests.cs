@@ -14,6 +14,7 @@ namespace JRunner.Cli.Tests;
 public sealed class CliNandPatchCommandTests
 {
     private const string CpuKeyText = "00112233445566778899AABBCCDDEEFF";
+    private const string InputPathSentinel = "INPUT_PATH_SECRET_4CB8D19A";
 
     [Theory]
     [InlineData("file")]
@@ -48,6 +49,112 @@ public sealed class CliNandPatchCommandTests
 
         AssertInspectableNandResult(result);
         Assert.Equal(0, standardInput.ReadCount);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task Nand_inspect_missing_files_or_parents_identify_input_without_disclosing_the_path(
+        bool missingParent,
+        bool jsonRequested)
+    {
+        using var temporaryDirectory = new TemporaryDirectory();
+        string inputPath = temporaryDirectory.File(
+            missingParent ? $"{InputPathSentinel}/nand.bin" : $"{InputPathSentinel}.bin");
+        string[] arguments = ["nand", "inspect", "--input", inputPath];
+        using var standardInput = new UnreadableInputReader();
+
+        CliResult result = await RunInProcessAsync(
+            jsonRequested ? [.. arguments, "--json"] : arguments, standardInput);
+
+        string message = AssertInputOpenFailure(
+            result, ExitCode.InputOutput, "io-error", "--input", inputPath, jsonRequested);
+        Assert.Contains("does not exist", message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, standardInput.ReadCount);
+        Assert.Empty(Directory.EnumerateFileSystemEntries(temporaryDirectory.Path));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Nand_inspect_directory_inputs_retain_permission_exit_and_explain_file_selection(
+        bool jsonRequested)
+    {
+        using var temporaryDirectory = new TemporaryDirectory();
+        string inputPath = temporaryDirectory.File(InputPathSentinel);
+        Directory.CreateDirectory(inputPath);
+        string[] arguments = ["nand", "inspect", "--input", inputPath];
+        using var standardInput = new UnreadableInputReader();
+
+        CliResult result = await RunInProcessAsync(
+            jsonRequested ? [.. arguments, "--json"] : arguments, standardInput);
+
+        string message = AssertInputOpenFailure(
+            result, ExitCode.DeviceUnavailable, "permission-denied", "--input", inputPath, jsonRequested);
+        Assert.Contains("directory", message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("file", message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("access was denied", message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, standardInput.ReadCount);
+    }
+
+    [InputOpenUnprivilegedLinuxTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Nand_inspect_denied_inputs_identify_permissions_without_disclosing_the_path(
+        bool jsonRequested)
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return;
+        }
+
+        using var temporaryDirectory = new TemporaryDirectory();
+        string inputPath = temporaryDirectory.File($"{InputPathSentinel}.bin");
+        await File.WriteAllBytesAsync(inputPath, CreateInspectableNandInput());
+        UnixFileMode originalMode = File.GetUnixFileMode(inputPath);
+        try
+        {
+            File.SetUnixFileMode(inputPath, (UnixFileMode)0);
+            string[] arguments = ["nand", "inspect", "--input", inputPath];
+            using var standardInput = new UnreadableInputReader();
+
+            CliResult result = await RunInProcessAsync(
+                jsonRequested ? [.. arguments, "--json"] : arguments, standardInput);
+
+            string message = AssertInputOpenFailure(
+                result, ExitCode.DeviceUnavailable, "permission-denied", "--input", inputPath, jsonRequested);
+            Assert.Contains("permission", message, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("denied", message, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("names a directory", message, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal(0, standardInput.ReadCount);
+        }
+        finally
+        {
+            File.SetUnixFileMode(inputPath, originalMode);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Nand_compare_missing_right_input_is_not_attributed_to_the_valid_left(
+        bool jsonRequested)
+    {
+        using var temporaryDirectory = new TemporaryDirectory();
+        string leftPath = temporaryDirectory.File("left.bin");
+        string rightPath = temporaryDirectory.File($"{InputPathSentinel}.bin");
+        await File.WriteAllBytesAsync(leftPath, CreateInspectableNandInput());
+        string[] arguments = ["nand", "compare", leftPath, rightPath];
+
+        CliResult result = await RunInProcessAsync(
+            jsonRequested ? [.. arguments, "--json"] : arguments, TextReader.Null);
+
+        string message = AssertInputOpenFailure(
+            result, ExitCode.InputOutput, "io-error", "<right>", rightPath, jsonRequested);
+        Assert.DoesNotContain("<left>", message, StringComparison.Ordinal);
+        AssertRedacted(result, leftPath);
     }
 
     [Theory]
@@ -653,6 +760,46 @@ public sealed class CliNandPatchCommandTests
         AssertRedacted(result, CpuKeyText);
     }
 
+    private static string AssertInputOpenFailure(
+        CliResult result,
+        ExitCode expectedCode,
+        string expectedKind,
+        string operand,
+        string suppliedPath,
+        bool jsonRequested)
+    {
+        Assert.Equal((int)expectedCode, result.ExitCode);
+        string message;
+        if (jsonRequested)
+        {
+            AssertFailure(result, expectedCode, expectedKind);
+            using JsonDocument document = ReadSingleEnvelope(result.StandardOutput);
+            Assert.Equal(1, document.RootElement.GetProperty("schemaVersion").GetInt32());
+            message = Assert.IsType<string>(
+                document.RootElement.GetProperty("error").GetProperty("message").GetString());
+        }
+        else
+        {
+            Assert.Equal(string.Empty, result.StandardOutput);
+            message = result.StandardError.TrimEnd('\r', '\n');
+        }
+
+        Assert.Contains(operand, message, StringComparison.Ordinal);
+        Assert.Equal(message + Environment.NewLine, result.StandardError);
+        AssertRedacted(result, suppliedPath);
+        AssertRedacted(result, InputPathSentinel);
+        foreach (string exceptionType in new[]
+        {
+            nameof(FileNotFoundException), nameof(DirectoryNotFoundException),
+            nameof(UnauthorizedAccessException), nameof(IOException),
+        })
+        {
+            AssertRedacted(result, exceptionType);
+        }
+
+        return message;
+    }
+
     private static JsonDocument ReadSingleEnvelope(string standardOutput)
     {
         // Parsing the entire stream rejects extra JSON envelopes and non-JSON stdout.
@@ -930,6 +1077,21 @@ public sealed class CliNandPatchCommandTests
             {
                 Directory.Delete(Path, recursive: true);
             }
+        }
+    }
+}
+
+internal sealed class InputOpenUnprivilegedLinuxTheoryAttribute : TheoryAttribute
+{
+    public InputOpenUnprivilegedLinuxTheoryAttribute()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            Skip = "Requires Linux file permissions.";
+        }
+        else if (WorkspacePathProtectionTests.GetEffectiveUserId() == 0)
+        {
+            Skip = "Requires an unprivileged user: mode bits do not deny root file access.";
         }
     }
 }

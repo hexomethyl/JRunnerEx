@@ -443,7 +443,12 @@ public sealed class CliXeBuildCommandTests
             Assert.Equal(string.Empty, capture.StandardOutput);
         }
 
-        Assert.Equal("The command arguments are invalid." + Environment.NewLine, capture.StandardError);
+        Assert.Contains("unrecognized", capture.StandardError, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Usage: jrunner xebuild build", capture.StandardError, StringComparison.Ordinal);
+        Assert.Contains("jrunner xebuild build --help", capture.StandardError, StringComparison.Ordinal);
+        Assert.DoesNotContain("--wine-prefix", capture.StandardError, StringComparison.Ordinal);
+        Assert.DoesNotContain(temporary.Path, capture.StandardError, StringComparison.Ordinal);
+        AssertSecretsAbsent(capture);
         Assert.Equal(0, input.ReadCount);
         Assert.Empty(backend.Requests);
         Assert.Empty(Directory.EnumerateFileSystemEntries(temporary.Path));

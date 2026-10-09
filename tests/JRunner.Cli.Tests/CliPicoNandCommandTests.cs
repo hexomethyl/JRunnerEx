@@ -41,6 +41,58 @@ public sealed class CliPicoNandCommandTests
     }
 
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Nand_write_missing_input_is_redacted_and_fails_before_any_device_access(
+        bool jsonRequested)
+    {
+        const string inputSentinel = "PICO_INPUT_SECRET_2C1DA78F";
+        using var temporaryDirectory = new TemporaryDirectory();
+        string inputPath = Path.Combine(temporaryDirectory.Path, $"{inputSentinel}.bin");
+        var arguments = new List<string>(BuildDestructiveArguments("write", acknowledge: true, inputPath));
+        if (!jsonRequested)
+        {
+            arguments.Remove("--json");
+        }
+
+        var enumerator = new SingleEndpointEnumerator();
+        var transportFactory = new NeverOpenedTransportFactory();
+        var connectionFactory = new PicoFlasherConnectionFactory(enumerator, transportFactory);
+        using var standardOutput = new StringWriter();
+        using var standardError = new StringWriter();
+        int exitCode = await CliCommandRouter.RunAsync(
+            arguments, standardOutput, standardError, CancellationToken.None, connectionFactory);
+
+        Assert.Equal((int)ExitCode.InputOutput, exitCode);
+        string message;
+        if (jsonRequested)
+        {
+            AssertFailure(standardOutput, ExitCode.InputOutput, "io-error");
+            using JsonDocument document = JsonDocument.Parse(standardOutput.ToString());
+            message = Assert.IsType<string>(
+                document.RootElement.GetProperty("error").GetProperty("message").GetString());
+        }
+        else
+        {
+            Assert.Equal(string.Empty, standardOutput.ToString());
+            message = standardError.ToString().TrimEnd('\r', '\n');
+        }
+
+        Assert.Contains("--input", message, StringComparison.Ordinal);
+        Assert.Contains("does not exist", message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(message + Environment.NewLine, standardError.ToString());
+        foreach (string supplied in new[] { inputPath, inputSentinel, nameof(FileNotFoundException) })
+        {
+            Assert.DoesNotContain(supplied, standardOutput.ToString(), StringComparison.Ordinal);
+            Assert.DoesNotContain(supplied, standardError.ToString(), StringComparison.Ordinal);
+        }
+
+        Assert.Equal(0, enumerator.EnumerateCallCount);
+        Assert.Equal(0, transportFactory.OpenCallCount);
+        Assert.Empty(Directory.EnumerateFileSystemEntries(temporaryDirectory.Path));
+    }
+
+    [Theory]
     [InlineData("write")]
     [InlineData("erase")]
     public async Task Acknowledged_destructive_commands_reach_device_selection(string operation)

@@ -20,7 +20,18 @@
 
 ## Verification and CI
 
-Use SDK `10.0.401` selected by `global.json`. From the repository root:
+Use SDK `10.0.401` selected by `global.json`; keep the exact
+`rollForward: disable` pin, and bump `sdk.version` and the version inside
+`sdk.errorMessage` together. Ubuntu apt ships only `10.0.1xx`, so from the
+repository root install the pin under `$HOME/.dotnet` (never `/tmp`) and run
+with `DOTNET_ROOT="$HOME/.dotnet"` and that directory first on `PATH` (see
+`README.md`):
+
+```sh
+curl -fsSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin --jsonfile global.json --install-dir "$HOME/.dotnet"
+```
+
+Then, from the repository root:
 
 ```sh
 dotnet restore JRunner.Native.sln --locked-mode

@@ -7,6 +7,8 @@ namespace JRunner.Cli.Tests;
 
 public sealed class CliApplicationTests
 {
+    private const string SecretSentinel = "CLI_SECRET_SENTINEL_7E53A90B";
+
     [Fact]
     public async Task Version_command_writes_the_version_only_to_standard_output()
     {
@@ -50,30 +52,34 @@ public sealed class CliApplicationTests
     }
 
     [Theory]
-    [InlineData("nand")]
-    [InlineData("patch")]
-    [InlineData("console")]
-    [InlineData("device")]
-    [InlineData("pico")]
-    [InlineData("support")]
-    [InlineData("xebuild")]
-    public async Task Unsupported_command_groups_json_use_the_shared_usage_error_envelope(string group)
+    [MemberData(nameof(PublicCommandGroups))]
+    public async Task Unsupported_command_groups_offer_only_their_registered_children(
+        string group,
+        string[] children,
+        bool jsonRequested)
     {
         using var standardOutput = new StringWriter();
         using var standardError = new StringWriter();
 
         var exitCode = await CliApplication.RunAsync(
-            [group, "--json"],
+            jsonRequested ? [group, "--json"] : [group],
             TextReader.Null,
             standardOutput,
             standardError);
 
-        AssertUsageFailure(
+        string message = AssertUsageFailure(
             exitCode,
             standardOutput.ToString(),
             standardError.ToString(),
-            jsonRequested: true,
+            jsonRequested,
             "unsupported-command");
+        AssertCanonicalGuidance(message, group);
+        foreach (string child in children)
+        {
+            Assert.Contains(child, message, StringComparison.Ordinal);
+        }
+
+        AssertGroupScope(message, group);
     }
 
     [Theory]
@@ -91,12 +97,22 @@ public sealed class CliApplicationTests
             standardOutput,
             standardError);
 
-        AssertUsageFailure(
+        string message = AssertUsageFailure(
             exitCode,
             standardOutput.ToString(),
             standardError.ToString(),
             jsonRequested: true,
             "unsupported-command");
+        foreach (string group in new[] { "nand", "patch", "console", "device", "pico", "support", "xebuild" })
+        {
+            Assert.Contains(group, message, StringComparison.Ordinal);
+        }
+
+        Assert.Contains("jrunner --help", message, StringComparison.Ordinal);
+        if (command is not null)
+        {
+            Assert.DoesNotContain(command, message, StringComparison.Ordinal);
+        }
     }
 
     [Theory]
@@ -184,25 +200,31 @@ public sealed class CliApplicationTests
     [InlineData("support", "status")]
     [InlineData("support", "install")]
     [InlineData("xebuild", "build")]
-    public async Task Canonical_public_command_help_json_writes_exactly_one_success_object(
+    public async Task Canonical_public_command_help_is_informative_in_human_and_JSON_modes(
         string group,
         string command)
     {
-        using var standardOutput = new StringWriter();
-        using var standardError = new StringWriter();
+        foreach (bool jsonRequested in new[] { false, true })
+        {
+            using var standardOutput = new StringWriter();
+            using var standardError = new StringWriter();
 
-        int exitCode = await CliApplication.RunAsync(
-            [group, command, "--help", "--json"],
-            TextReader.Null,
-            standardOutput,
-            standardError);
+            int exitCode = await CliApplication.RunAsync(
+                jsonRequested ? [group, command, "--help", "--json"] : [group, command, "--help"],
+                TextReader.Null,
+                standardOutput,
+                standardError);
 
-        Assert.Equal(0, exitCode);
-        Assert.Equal(string.Empty, standardError.ToString());
-        using JsonDocument document = JsonDocument.Parse(standardOutput.ToString());
-        AssertEnvelope(document.RootElement, success: true);
-        string help = Assert.IsType<string>(document.RootElement.GetProperty("result").GetString());
-        Assert.Contains($"Usage: jrunner {group} {command}", help);
+            Assert.Equal(0, exitCode);
+            Assert.Equal(string.Empty, standardError.ToString());
+            string help = ReadHelp(standardOutput.ToString(), jsonRequested);
+            Assert.Contains($"Usage: jrunner {group} {command}", help, StringComparison.Ordinal);
+            Assert.Contains($"jrunner {group} {command}", ReadHelpExamples(help), StringComparison.Ordinal);
+            Assert.Contains("Notes:", help, StringComparison.Ordinal);
+            Assert.Contains("Global options:", help, StringComparison.Ordinal);
+            Assert.DoesNotContain("Missing required", help, StringComparison.OrdinalIgnoreCase);
+            AssertGlobalHelp(help);
+        }
     }
 
     [Fact]
@@ -278,7 +300,7 @@ public sealed class CliApplicationTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task Missing_required_leaf_operands_use_a_generic_redacted_usage_error(bool jsonRequested)
+    public async Task Missing_required_leaf_operands_identify_the_option_and_canonical_usage(bool jsonRequested)
     {
         using var standardOutput = new StringWriter();
         using var standardError = new StringWriter();
@@ -290,12 +312,15 @@ public sealed class CliApplicationTests
             standardOutput,
             standardError);
 
-        AssertUsageFailure(
+        string message = AssertUsageFailure(
             exitCode,
             standardOutput.ToString(),
             standardError.ToString(),
             jsonRequested,
             "invalid-command-arguments");
+        Assert.Contains("--input", message, StringComparison.Ordinal);
+        Assert.Contains("missing", message, StringComparison.OrdinalIgnoreCase);
+        AssertCanonicalGuidance(message, "nand inspect");
     }
 
     [Theory]
@@ -384,7 +409,7 @@ public sealed class CliApplicationTests
     [InlineData(false, true)]
     [InlineData(true, false)]
     [InlineData(true, true)]
-    public async Task An_old_XeBuild_option_is_rejected_with_a_generic_redacted_error_even_with_help(
+    public async Task An_old_XeBuild_option_is_rejected_with_a_redacted_error_even_with_help(
         bool helpRequested,
         bool jsonRequested)
     {
@@ -429,6 +454,299 @@ public sealed class CliApplicationTests
         Assert.False(Directory.Exists(root));
     }
 
+    public static IEnumerable<object[]> PublicCommandGroups()
+    {
+        (string Group, string[] Children)[] groups =
+        [
+            ("nand", ["inspect", "compare", "rgh3-convert"]),
+            ("patch", ["inspect"]),
+            ("console", ["list"]),
+            ("device", ["list"]),
+            ("pico", ["probe", "smc-stop", "smc-start", "reboot-bootloader",
+                "nand-read", "nand-write", "nand-erase", "emmc-probe", "emmc-read"]),
+            ("support", ["status", "install"]),
+            ("xebuild", ["build"]),
+        ];
+        foreach (var (group, children) in groups)
+        {
+            foreach (bool jsonRequested in new[] { false, true })
+            {
+                yield return [group, children, jsonRequested];
+            }
+        }
+    }
+
+    [Theory]
+    [MemberData(nameof(PublicCommandGroups))]
+    public async Task Group_help_has_its_own_usage_children_and_example(
+        string group,
+        string[] children,
+        bool jsonRequested)
+    {
+        using var standardOutput = new StringWriter();
+        using var standardError = new StringWriter();
+        int exitCode = await CliApplication.RunAsync(
+            jsonRequested ? [group, "--help", "--json"] : [group, "--help"],
+            TextReader.Null,
+            standardOutput,
+            standardError);
+
+        Assert.Equal(0, exitCode);
+        Assert.Equal(string.Empty, standardError.ToString());
+        string help = ReadHelp(standardOutput.ToString(), jsonRequested);
+        Assert.Contains($"Usage: jrunner {group} <command> [options]", help, StringComparison.Ordinal);
+        int commandsIndex = help.IndexOf("Commands:", StringComparison.Ordinal);
+        int globalOptionsIndex = help.IndexOf("Global options:", StringComparison.Ordinal);
+        Assert.True(commandsIndex >= 0 && globalOptionsIndex > commandsIndex);
+        string[] commandPaths = help[(commandsIndex + "Commands:".Length)..globalOptionsIndex]
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(row => string.Join(" ", row.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Take(3)))
+            .ToArray();
+        Assert.Equal(children.Length, commandPaths.Length);
+        foreach (string child in children)
+        {
+            Assert.Contains($"jrunner {group} {child}", commandPaths);
+        }
+
+        Assert.Contains($"jrunner {group} {children[0]} --help", ReadHelpExamples(help), StringComparison.Ordinal);
+        AssertGlobalHelp(help);
+    }
+
+    public static IEnumerable<object[]> MalformedLeafInvocations()
+    {
+        (string[] Arguments, string Command, string[] Fragments)[] cases =
+        [
+            (["nand", "inspect", "--input"], "nand inspect", ["--input", "value", "<file>"]),
+            (["nand", "compare", SecretSentinel], "nand compare", ["<right>", "missing"]),
+            (["pico", "nand-read", "--start-block", SecretSentinel, "--output", "unused.bin"],
+                "pico nand-read", ["--start-block", "whole number", "4294967295"]),
+            (["pico", "probe", "--timeout", SecretSentinel],
+                "pico probe", ["--timeout", "number"]),
+            (["xebuild", "build", "--dashboard", SecretSentinel],
+                "xebuild build", ["--dashboard", "whole number", "-2147483648", "2147483647"]),
+            (["nand", "inspect", "--input", SecretSentinel, "--input", SecretSentinel + "_SECOND"],
+                "nand inspect", ["--input", "one value", "once"]),
+            (["nand", "compare", SecretSentinel, SecretSentinel + "_RIGHT", SecretSentinel + "_EXTRA"],
+                "nand compare", ["unrecognized", "1"]),
+            (["nand", "inspect", "--input", SecretSentinel, "--inptu", SecretSentinel],
+                "nand inspect", ["unrecognized", "2"]),
+        ];
+        foreach (var (arguments, command, fragments) in cases)
+        {
+            foreach (bool jsonRequested in new[] { false, true })
+            {
+                yield return [arguments, command, fragments, jsonRequested];
+            }
+        }
+    }
+
+    [Theory]
+    [MemberData(nameof(MalformedLeafInvocations))]
+    public async Task Malformed_leaf_invocations_explain_safe_operands_and_canonical_repair(
+        string[] arguments,
+        string command,
+        string[] expectedFragments,
+        bool jsonRequested)
+    {
+        using var standardOutput = new StringWriter();
+        using var standardError = new StringWriter();
+        int exitCode = await CliApplication.RunAsync(
+            jsonRequested ? [.. arguments, "--json"] : arguments,
+            TextReader.Null,
+            standardOutput,
+            standardError);
+
+        string message = AssertUsageFailure(
+            exitCode, standardOutput.ToString(), standardError.ToString(), jsonRequested,
+            "invalid-command-arguments");
+        string diagnosis = ReadDiagnosis(message);
+        foreach (string fragment in expectedFragments)
+        {
+            Assert.Contains(fragment, diagnosis, StringComparison.OrdinalIgnoreCase);
+        }
+
+        AssertCanonicalGuidance(message, command);
+        Assert.DoesNotContain(SecretSentinel, standardOutput.ToString(), StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(SecretSentinel, standardError.ToString(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task An_input_before_the_command_explains_the_missing_selector_without_echoing_the_path(
+        bool jsonRequested)
+    {
+        string suppliedPath = Path.Combine(Path.GetTempPath(), SecretSentinel, "nanddump.bin");
+        string[] arguments = [suppliedPath, "nand", "inspect"];
+        using var standardOutput = new StringWriter();
+        using var standardError = new StringWriter();
+        int exitCode = await CliApplication.RunAsync(
+            jsonRequested ? [.. arguments, "--json"] : arguments,
+            TextReader.Null,
+            standardOutput,
+            standardError);
+
+        string message = AssertUsageFailure(
+            exitCode, standardOutput.ToString(), standardError.ToString(), jsonRequested,
+            "invalid-command-arguments");
+        string diagnosis = ReadDiagnosis(message);
+        Assert.Contains("--input", diagnosis, StringComparison.Ordinal);
+        Assert.Contains("missing", diagnosis, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("unrecognized", diagnosis, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("1", diagnosis, StringComparison.Ordinal);
+        AssertCanonicalGuidance(message, "nand inspect");
+        Assert.Contains("Example: jrunner nand inspect --input nanddump.bin", message, StringComparison.Ordinal);
+        Assert.DoesNotContain(suppliedPath, standardOutput.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(suppliedPath, standardError.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(SecretSentinel, standardOutput.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(SecretSentinel, standardError.ToString(), StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("--help", false)]
+    [InlineData("--help", true)]
+    [InlineData("--version", false)]
+    [InlineData("--version", true)]
+    public async Task Malformed_information_values_do_not_report_omitted_mandatory_operands(
+        string informationFlag,
+        bool jsonRequested)
+    {
+        string[] arguments = ["xebuild", "build", "--dashboard", SecretSentinel, informationFlag];
+        using var standardOutput = new StringWriter();
+        using var standardError = new StringWriter();
+        int exitCode = await CliApplication.RunAsync(
+            jsonRequested ? [.. arguments, "--json"] : arguments,
+            TextReader.Null,
+            standardOutput,
+            standardError);
+
+        string message = AssertUsageFailure(
+            exitCode, standardOutput.ToString(), standardError.ToString(), jsonRequested,
+            "invalid-command-arguments");
+        string diagnosis = ReadDiagnosis(message);
+        Assert.Contains("--dashboard", diagnosis, StringComparison.Ordinal);
+        Assert.Contains("whole number", diagnosis, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("missing", diagnosis, StringComparison.OrdinalIgnoreCase);
+        foreach (string omittedOption in new[] { "--input", "--output", "--type" })
+        {
+            Assert.DoesNotContain(omittedOption, diagnosis, StringComparison.Ordinal);
+        }
+
+        AssertCanonicalGuidance(message, "xebuild build");
+        Assert.DoesNotContain(SecretSentinel, standardOutput.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(SecretSentinel, standardError.ToString(), StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(null, false)]
+    [InlineData(null, true)]
+    [InlineData("--help", false)]
+    [InlineData("--help", true)]
+    [InlineData("--version", false)]
+    [InlineData("--version", true)]
+    public async Task Unknown_option_names_values_paths_environment_names_and_operands_are_redacted(
+        string? informationFlag,
+        bool jsonRequested)
+    {
+        foreach (bool inlineValue in new[] { false, true })
+        {
+            string suppliedPath = Path.Combine(Path.GetTempPath(), SecretSentinel, "input.bin");
+            string environmentName = "JRUNNER_" + SecretSentinel;
+            List<string> arguments =
+            [
+                "nand", "inspect", "--input", suppliedPath, "--cpu-key-env", environmentName,
+                inlineValue ? $"--{SecretSentinel}={SecretSentinel}" : $"--{SecretSentinel}",
+            ];
+            if (!inlineValue)
+            {
+                arguments.Add(SecretSentinel + "_VALUE");
+            }
+
+            arguments.Add(SecretSentinel + "_OPERAND");
+            if (informationFlag is not null)
+            {
+                arguments.Add(informationFlag);
+            }
+
+            if (jsonRequested)
+            {
+                arguments.Add("--json");
+            }
+
+            using var standardOutput = new StringWriter();
+            using var standardError = new StringWriter();
+            int exitCode = await CliApplication.RunAsync(
+                arguments, TextReader.Null, standardOutput, standardError);
+            string message = AssertUsageFailure(
+                exitCode, standardOutput.ToString(), standardError.ToString(), jsonRequested,
+                "invalid-command-arguments");
+            Assert.Contains("unrecognized", ReadDiagnosis(message), StringComparison.OrdinalIgnoreCase);
+            AssertCanonicalGuidance(message, "nand inspect");
+            foreach (string supplied in new[] { SecretSentinel, suppliedPath, environmentName })
+            {
+                Assert.DoesNotContain(supplied, standardOutput.ToString(), StringComparison.OrdinalIgnoreCase);
+                Assert.DoesNotContain(supplied, standardError.ToString(), StringComparison.OrdinalIgnoreCase);
+            }
+        }
+    }
+
+    private static string ReadHelp(string standardOutput, bool jsonRequested)
+    {
+        if (!jsonRequested)
+        {
+            return standardOutput;
+        }
+
+        using JsonDocument document = JsonDocument.Parse(standardOutput);
+        AssertEnvelope(document.RootElement, success: true);
+        return Assert.IsType<string>(document.RootElement.GetProperty("result").GetString());
+    }
+
+    private static void AssertGlobalHelp(string help)
+    {
+        foreach (string option in new[] { "-h", "--help", "/h", "-?", "/?", "--version", "--json", "--support-root <path>" })
+        {
+            Assert.Contains(option, help, StringComparison.Ordinal);
+        }
+    }
+
+    private static void AssertGroupScope(string message, string group)
+    {
+        foreach (var (owner, distinctiveChild) in new[]
+        {
+            ("nand", "rgh3-convert"), ("pico", "nand-read"),
+            ("support", "support install"), ("xebuild", "xebuild build"),
+        })
+        {
+            if (group != owner)
+            {
+                Assert.DoesNotContain(distinctiveChild, message, StringComparison.Ordinal);
+            }
+        }
+    }
+
+    private static string ReadDiagnosis(string message)
+    {
+        int usageIndex = message.IndexOf("Usage:", StringComparison.Ordinal);
+        Assert.True(usageIndex > 0);
+        return message[..usageIndex];
+    }
+
+    private static void AssertCanonicalGuidance(string message, string command)
+    {
+        Assert.Contains($"Usage: jrunner {command}", message, StringComparison.Ordinal);
+        Assert.Contains($"Example: jrunner {command}", message, StringComparison.Ordinal);
+        Assert.Contains($"jrunner {command} --help", message, StringComparison.Ordinal);
+    }
+
+    private static string ReadHelpExamples(string help)
+    {
+        const string heading = "Examples:";
+        int examplesIndex = help.IndexOf(heading, StringComparison.Ordinal);
+        Assert.True(examplesIndex > 0);
+        return help[(examplesIndex + heading.Length)..];
+    }
+
     private static void AssertRootHelp(string help)
     {
         Assert.Contains("Usage: jrunner [--support-root <path>] <command> [options]", help);
@@ -436,11 +754,15 @@ public sealed class CliApplicationTests
         foreach (string command in new[]
         {
             "nand inspect", "nand compare", "nand rgh3-convert", "patch inspect",
-            "console list", "device list", "pico probe", "support status", "support install", "xebuild build",
+            "console list", "device list", "pico probe", "pico smc-stop", "pico smc-start",
+            "pico reboot-bootloader", "pico nand-read", "pico nand-write", "pico nand-erase",
+            "pico emmc-probe", "pico emmc-read", "support status", "support install", "xebuild build",
         })
         {
             Assert.Contains(command, help);
         }
+        AssertGlobalHelp(help);
+        Assert.Contains("jrunner nand inspect --help", ReadHelpExamples(help), StringComparison.Ordinal);
     }
 
     private static void AssertEnvelope(JsonElement envelope, bool success)
@@ -450,7 +772,7 @@ public sealed class CliApplicationTests
         Assert.Equal(success, envelope.GetProperty("ok").GetBoolean());
     }
 
-    private static void AssertUsageFailure(
+    private static string AssertUsageFailure(
         int exitCode,
         string standardOutput,
         string standardError,
@@ -475,11 +797,11 @@ public sealed class CliApplicationTests
             message = standardError.TrimEnd('\r', '\n');
         }
 
-        if (expectedKind == "invalid-command-arguments")
-        {
-            Assert.Equal("The command arguments are invalid.", message);
-        }
-
         Assert.Equal(message + Environment.NewLine, standardError);
+        Assert.False(string.IsNullOrWhiteSpace(message));
+        Assert.Contains("Usage: jrunner", message, StringComparison.Ordinal);
+        Assert.Contains("Example: jrunner", message, StringComparison.Ordinal);
+        Assert.Contains("--help", message, StringComparison.Ordinal);
+        return message;
     }
 }
